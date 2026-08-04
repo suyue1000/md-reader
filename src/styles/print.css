@@ -1,0 +1,127 @@
+/**
+ * 打印样式。
+ *
+ * 阅读器的屏幕布局是「整屏固定高度 + 内部滚动」，这套结构直接打印
+ * 只会输出第一屏。打印时必须把它还原成正常的文档流：
+ * 外壳改为块级、高度自适应、滚动容器不再裁剪内容。
+ */
+
+@media print {
+  /* 工具栏、侧栏、状态栏、进度条、返回顶部等界面元素一律不打印 */
+  .no-print {
+    display: none !important;
+  }
+
+  html,
+  body,
+  #root {
+    height: auto !important;
+    overflow: visible !important;
+    background: #fff !important;
+  }
+
+  /* 打破「固定高度 + 内部滚动」的屏幕布局 */
+  .app-shell,
+  .app-body {
+    display: block !important;
+    height: auto !important;
+    overflow: visible !important;
+  }
+
+  .app-main {
+    overflow: visible !important;
+  }
+
+  /* 正文占满纸张宽度，屏幕上的居中留白在纸上没有意义 */
+  .app-article {
+    max-width: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  /**
+   * 强制浅色。
+   * 深色主题下直接打印会得到满页深色背景（多数浏览器会剥掉背景色，
+   * 但文字仍是浅色，结果是白纸白字）。这里覆盖关键令牌而不是整套调色板，
+   * 保证输出始终是黑字白底。
+   *
+   * 这里刻意保留裸的 `[data-theme]` 属性选择器 (0,1,1)：令牌三层
+   * （theme.css / app-theme / user-style）都被拉平到 (0,0,1)，
+   * 打印规则高出一档，与它们在文档中的先后无关，总能赢。
+   * 这一点很关键——`<style id="app-theme">` 是运行时注入的，
+   * 永远排在打包样式表之后，靠顺序是赢不了的。
+   */
+  :root,
+  :root[data-theme='light'],
+  :root[data-theme='dark'] {
+    color-scheme: light !important;
+    --app-bg: #ffffff;
+    --app-surface: #ffffff;
+    --app-elevated: #ffffff;
+    --app-text: #000000;
+    --app-text-muted: #333333;
+    --app-text-subtle: #555555;
+    --app-border: #999999;
+    --app-border-subtle: #cccccc;
+    --app-code-bg: #f6f8fa;
+    --app-code-border: #cccccc;
+    --app-accent: #0b57d0;
+  }
+
+  /* Shiki 双主题：打印时固定用浅色那一套 */
+  .markdown-body .shiki,
+  .markdown-body .shiki span {
+    color: var(--shiki-light) !important;
+    background-color: transparent !important;
+  }
+
+  /* 折叠的代码块在纸上应完整展开——纸没有「点击展开」 */
+  .markdown-body .code-block.is-collapsed .code-block__pre {
+    max-height: none !important;
+    mask-image: none !important;
+  }
+
+  /* 代码块与表格在纸上要能换行，否则右侧内容会被裁掉 */
+  .markdown-body .code-block__pre {
+    white-space: pre-wrap !important;
+    word-break: break-word !important;
+    overflow: visible !important;
+  }
+
+  .markdown-body table {
+    display: table !important;
+    width: 100% !important;
+    overflow: visible !important;
+  }
+
+  /* 避免元素被页边拦腰截断 */
+  .markdown-body pre,
+  .markdown-body table,
+  .markdown-body blockquote,
+  .markdown-body .code-block,
+  .markdown-body .mermaid-block,
+  .markdown-body img {
+    break-inside: avoid;
+  }
+
+  /* 标题不要孤零零留在页尾 */
+  .markdown-body h1,
+  .markdown-body h2,
+  .markdown-body h3,
+  .markdown-body h4 {
+    break-after: avoid;
+  }
+
+  /* 纸上点不了链接，把外链地址显式印出来 */
+  .markdown-body a[href^='http']::after {
+    content: ' (' attr(href) ')';
+    font-size: 0.85em;
+    color: #555;
+    word-break: break-all;
+  }
+
+  /* 标题锚点是交互装饰，纸上是噪音 */
+  .markdown-body .heading-anchor {
+    display: none !important;
+  }
+}

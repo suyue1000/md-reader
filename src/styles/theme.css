@@ -1,0 +1,136 @@
+/**
+ * 设计令牌（Design Tokens）。
+ *
+ * 全部主题差异都收敛在 CSS 变量里，组件只写语义类（bg-surface / text-muted），
+ * 切换主题时不需要重新渲染任何 React 组件——只改根节点的 data-theme。
+ * 这既满足「深浅色切换 150ms 内完成」，也避免了 dark: 前缀满天飞。
+ *
+ * 关于 `:root:where([data-theme='…'])`：`:where()` 内部的特异度恒为 0，
+ * 所以这些块与裸 `:root` 一样都是 (0,0,1)。令牌层全部拉平到同一特异度后，
+ * 胜负只由文档顺序决定——基础层 < 阅读主题(app-theme) < 用户 CSS(user-style)，
+ * 顺序即优先级，见 utils/style-slots.ts。若这里写成 `[data-theme]` 的裸属性
+ * 选择器 (0,1,1)，用户写 `:root { --app-bg: … }` 将永远无效。
+ */
+
+:root,
+:root:where([data-theme='light']) {
+  color-scheme: light;
+
+  /* 背景层级：page < surface < elevated */
+  --app-bg: #ffffff;
+  --app-surface: #f6f8fa;
+  --app-elevated: #ffffff;
+  --app-overlay: rgb(0 0 0 / 0.32);
+
+  /* 文本 */
+  --app-text: #1f2328;
+  --app-text-muted: #59636e;
+  --app-text-subtle: #818b98;
+
+  /* 描边与分隔 */
+  --app-border: #d1d9e0;
+  --app-border-subtle: #e4e8ed;
+
+  /* 强调色 */
+  --app-accent: #2563eb;
+  --app-accent-hover: #1d4ed8;
+  --app-accent-soft: #dbeafe;
+  --app-accent-contrast: #ffffff;
+
+  /* 状态色 */
+  --app-danger: #cf222e;
+  --app-success: #1a7f37;
+  --app-warning: #9a6700;
+
+  /* 交互态 */
+  --app-hover: rgb(31 35 40 / 0.06);
+  --app-active: rgb(31 35 40 / 0.1);
+  --app-selection: #b6d7ff;
+
+  /* 代码 */
+  --app-code-bg: #f6f8fa;
+  --app-code-border: #e4e8ed;
+
+  /* 阴影：需求要求「轻阴影」 */
+  --app-shadow-sm: 0 1px 2px rgb(31 35 40 / 0.06);
+  --app-shadow-md: 0 2px 8px rgb(31 35 40 / 0.08);
+  --app-shadow-lg: 0 8px 24px rgb(31 35 40 / 0.12);
+}
+
+:root:where([data-theme='dark']) {
+  color-scheme: dark;
+
+  --app-bg: #0d1117;
+  --app-surface: #161b22;
+  --app-elevated: #1c2128;
+  --app-overlay: rgb(0 0 0 / 0.6);
+
+  --app-text: #e6edf3;
+  --app-text-muted: #9198a1;
+  --app-text-subtle: #6e7681;
+
+  --app-border: #30363d;
+  --app-border-subtle: #21262d;
+
+  --app-accent: #4493f8;
+  --app-accent-hover: #6cb0ff;
+  --app-accent-soft: #182a44;
+  --app-accent-contrast: #0d1117;
+
+  --app-danger: #f85149;
+  --app-success: #3fb950;
+  --app-warning: #d29922;
+
+  --app-hover: rgb(230 237 243 / 0.08);
+  --app-active: rgb(230 237 243 / 0.12);
+  --app-selection: #264f78;
+
+  --app-code-bg: #161b22;
+  --app-code-border: #30363d;
+
+  --app-shadow-sm: 0 1px 2px rgb(1 4 9 / 0.4);
+  --app-shadow-md: 0 2px 8px rgb(1 4 9 / 0.5);
+  --app-shadow-lg: 0 8px 24px rgb(1 4 9 / 0.6);
+}
+
+/**
+ * 首帧兜底：模块脚本是 defer 的，浏览器有可能在 JS 打上 data-theme 之前
+ * 就画出第一帧。这里用纯 CSS 让「尚未标记主题」的文档跟随系统色，
+ * 深色用户不会看到一闪而过的白底。只覆盖首帧可见的少量属性，
+ * 完整调色板仍由 data-theme 驱动。
+ */
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme])) {
+    color-scheme: dark;
+    --app-bg: #0d1117;
+    --app-surface: #161b22;
+    --app-text: #e6edf3;
+    --app-border-subtle: #21262d;
+  }
+}
+
+/**
+ * 正文排版变量。
+ * 由设置驱动（见 hooks/useThemeStyles），默认值与 DEFAULT_SETTINGS 保持一致，
+ * 保证 React 尚未挂载时首屏也是正确排版。
+ */
+:root {
+  --content-font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, 'PingFang SC',
+    'Microsoft YaHei', sans-serif;
+  --content-font-size: 16px;
+  --content-line-height: 1.7;
+  --content-letter-spacing: 0px;
+  --content-max-width: 980px;
+
+  /* 交互动效：需求指定 150ms */
+  --app-duration: 150ms;
+  --app-ease: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* 尊重用户的「减少动效」系统偏好 */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --app-duration: 0ms;
+  }
+}

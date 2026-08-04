@@ -1,0 +1,10 @@
+{
+  "extName": {
+    "message": "Markdown Reader",
+    "description": "扩展名称"
+  },
+  "extDescription": {
+    "message": "轻量、快速的本地 Markdown 阅读器：GFM 渲染、目录导航、自动刷新、完全离线。",
+    "description": "扩展描述"
+  }
+}

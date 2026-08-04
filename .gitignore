@@ -1,0 +1,11 @@
+node_modules
+dist
+dist.zip
+coverage
+.DS_Store
+*.local
+.vscode/*
+!.vscode/extensions.json
+# 图标为构建产物（npm run icons 生成）
+public/icons
+release/
