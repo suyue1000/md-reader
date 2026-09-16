@@ -473,37 +473,6 @@
   color: var(--app-accent-contrast);
 }
 
-/* ---------- 图片放大 ---------- */
-
-.markdown-body img.is-zoomable {
-  cursor: zoom-in;
-}
-
-.image-lightbox {
-  position: fixed;
-  inset: 0;
-  z-index: 60;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 3vmin;
-  background: var(--app-overlay);
-  cursor: zoom-out;
-}
-
-.image-lightbox[hidden] {
-  display: none;
-}
-
-.image-lightbox__img {
-  max-width: 100%;
-  max-height: 100%;
-  border-radius: 8px;
-  box-shadow: var(--app-shadow-lg);
-  /* 图片本身不响应点击，点哪儿都算点在遮罩上，随手一点即可关闭 */
-  pointer-events: none;
-}
-
 /* ---------- 编辑器块 widget ---------- */
 
 /*
@@ -522,4 +491,14 @@
 
 .cm-md-block {
   padding-block: 0.4em;
+  /*
+   * 必须显式声明。CodeMirror 给 `.cm-content` 设的 `white-space: break-spaces`
+   * 会继承进块 widget，于是净化后 HTML 里每个块级标签后面那个换行都被原样
+   * 保留成一次换行，各占一个 27.2px 的空行盒——每块白白多出一行，一篇 60 块
+   * 的文档约 1600px 的死白，且屏幕的排版节奏与导出产物对不上（屏幕上标题
+   * 下方比上方还宽）。
+   *
+   * 这一行是 `block-height.ts` 整套高度常量的支柱之一，改它必须连那边一起改。
+   */
+  white-space: normal;
 }

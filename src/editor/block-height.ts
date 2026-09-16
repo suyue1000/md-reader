@@ -50,10 +50,11 @@ import type { RenderedBlock } from './block-render';
  *    照着后者去改 CSS 会改错地方。）
  * 2. **块自己有上下内边距**：同一节里的 `.cm-md-block { padding-block: 0.4em }`
  *    = 6.4px×2 = 12.8px，也是本项目写的。
- * 3. **`.cm-content` 的 `white-space: break-spaces` 会继承进块 widget**，于是
- *    净化后 HTML 里每一个「块级标签后紧跟的换行」都**保留成一次换行**，各占一个
- *    27.2px 的空行盒。一个 `<p>甲</p>\n` 因此有 27.2 + 27.2 = 54.4 的正文高度，
- *    而不是 27.2。
+ * 3. **块 widget 是 `white-space: normal`**：`markdown.css` 的同一节里显式声明。
+ *    不声明的话，`.cm-content` 的 `white-space: break-spaces` 会继承进来，净化后
+ *    HTML 里每个「块级标签后紧跟的换行」都保留成一次换行、各占一个 27.2px 的空行盒，
+ *    每块白白多出一行。声明之后这些换行按常规折叠成空格，不再产生行盒。
+ *    注意 `<br>` 不受影响——它在 `normal` 下照样强制断行，仍要单独计数。
  *
  * **所以 `markdown.css` 的「编辑器块 widget」那一节（`> :first-child` /
  * `> :last-child` / `padding-block`）是这套常量的唯一支柱。** 动那几行会让整套
@@ -80,9 +81,10 @@ import type { RenderedBlock } from './block-render';
  *
  * 用户改字号会让这些数一起偏，但偏的是估算而不是结果，见上一段。
  *
- * 顺带记一笔：上面第 3 条意味着**每个块都白白多出一个空行盒**（一篇 60 块的
- * 文档约 1600px 的死白）。给 `.cm-md-block` 补一句 `white-space: normal` 就能
- * 消掉，但那是一次会改变全篇排版的改动，不该由「修估算注释」顺手带出来。
+ * 上面那张对账表是**加 `white-space: normal` 之前**量的，每个数都含一个 27.2px
+ * 的空行盒。当前这套常量是在那份实测的基础上逐项扣除空行盒推导出来的（标题各减
+ * 27、表格每行由 60 回到 `<tr>` 自身的 41、块外壳由 40 减到只剩 widget 内边距 13），
+ * **尚未在真实浏览器里重新标定**。要复测的话，量 `.cm-md-block` 的边框盒即可。
  */
 
 /** 正文行高：`--content-font-size` 16px × `--content-line-height` 1.7 = 27.2 */
@@ -95,15 +97,6 @@ const TEXT_LINE_PX = 27;
  * 它计入 ResizeObserver 量到的边框盒，估算漏掉它每块就差 13px。
  */
 const WIDGET_PADDING_PX = 13;
-
-/**
- * 一个「普通块」除内容行以外的固定开销 = widget 内边距 + 末尾那一个空行盒。
- *
- * 用在「HTML 里只有一处 `>\n`」的块上（标题、单段落、表格、图片这些）。
- * 列表、引用块这类内部还有嵌套块级元素的，空行盒不止一个，走
- * `strayLineBoxes()` 逐个数，见 `estimateBlockHeight` 的兜底分支。
- */
-const BLOCK_CHROME_PX = WIDGET_PADDING_PX + TEXT_LINE_PX;
 
 /**
  * 一行大致放得下多少个「半宽单位」（一个西文字符算 1，一个汉字算 2）。
@@ -131,8 +124,8 @@ const CODE_LINE_PX = 22;
  * + `.code-block` 上下边框 2
  * + widget 内边距 12.8。
  *
- * 没有空行盒那一项：代码块由插件的自定义 fence 渲染器产出，HTML 以 `</figure>`
- * 收尾、后面不带换行（实测）。所以这一支**不**再加 `BLOCK_CHROME_PX`。
+ * 这 72 里已经含了 widget 内边距（12.8），所以这一支**不**再另加
+ * `WIDGET_PADDING_PX`——加了会把它算两遍。
  */
 const CODE_CHROME_PX = 72;
 
@@ -140,11 +133,13 @@ const CODE_CHROME_PX = 72;
  * 表格的每一行，实测 60。
  *
  * `<tr>` 本身量到 40.7（th/td 上下内边距 0.5em×2 = 14.7 + 0.92em 字号下的行盒
- * 25.0 + 折叠边框 1）。剩下的 ~19 是表格 HTML 里那些换行：`.markdown-body table`
- * 被设成了 `display: block`，于是一部分换行落在表内匿名盒里被丢弃、一部分没有，
- * 数不清也没必要数——直接按实测的 4 行表整块 280px 反推每行 60。
+ * 25.0 + 折叠边框 1）。
+ *
+ * 改 `white-space: normal` 之前这个数是 60：多出来的 ~19 是表格 HTML 里那些
+ * 换行撑出的行盒（`.markdown-body table` 是 `display: block`，一部分换行落在
+ * 表内匿名盒里被丢弃、一部分没有）。换行折叠之后它们一并消失，回到 `<tr>` 自身。
  */
-const TABLE_ROW_PX = 60;
+const TABLE_ROW_PX = 41;
 
 /**
  * 图片按一张 320px 估（整块，含外壳）。
@@ -164,21 +159,22 @@ const IMAGE_PX = 320;
 const DIAGRAM_PX = 320;
 
 /**
- * 各级标题的整块高度，实测 88.3 / 78.1 / 64.9 / 61.8 / 59.7 / 58.7。
+ * 各级标题的整块高度。`white-space: normal` 之前实测 88.3 / 78.1 / 64.9 /
+ * 61.8 / 59.7 / 58.7，各含一个 27.2px 的空行盒；折叠之后各减一个行盒。
  *
  * 算式（markdown.css：标题 line-height 1.3，h1/h2 另有 0.3em 下内边距 + 1px 下边框；
  * em 基准是**标题自己的字号**，不是 16px）：
- * h1 1.85em×16 = 29.6 → 行盒 38.5 + 内边距 8.9 + 边框 1 + 外壳 40 ≈ 88
- * h2 1.45em×16 = 23.2 → 行盒 30.2 + 内边距 7.0 + 边框 1 + 外壳 40 ≈ 78
- * h3 1.20em×16 = 19.2 → 行盒 25.0 + 外壳 40 ≈ 65
- * h4 1.05em×16 = 16.8 → 行盒 21.8 + 外壳 40 ≈ 62
- * h5 0.95em×16 = 15.2 → 行盒 19.8 + 外壳 40 ≈ 60
- * h6 0.90em×16 = 14.4 → 行盒 18.7 + 外壳 40 ≈ 59
+ * h1 1.85em×16 = 29.6 → 行盒 38.5 + 内边距 8.9 + 边框 1 + widget 内边距 13 ≈ 61
+ * h2 1.45em×16 = 23.2 → 行盒 30.2 + 内边距 7.0 + 边框 1 + widget 内边距 13 ≈ 51
+ * h3 1.20em×16 = 19.2 → 行盒 25.0 + widget 内边距 13 ≈ 38
+ * h4 1.05em×16 = 16.8 → 行盒 21.8 + widget 内边距 13 ≈ 35
+ * h5 0.95em×16 = 15.2 → 行盒 19.8 + widget 内边距 13 ≈ 33
+ * h6 0.90em×16 = 14.4 → 行盒 18.7 + widget 内边距 13 ≈ 32
  *
  * 标题的 `margin: 1.6em 0 0.6em` 一概不算：Preflight 已经把它归零了（见文件
  * 顶部第 1 条），块与块之间的空隙来自那条空行。
  */
-const HEADING_PX = [88, 78, 65, 62, 60, 59] as const;
+const HEADING_PX = [61, 51, 38, 35, 33, 32] as const;
 
 /** 数一个子串出现了几次。比 `match(/re/g)` 便宜，也不产生中间数组 */
 function countOccurrences(haystack: string, needle: string): number {
@@ -223,29 +219,21 @@ function wrappedLines(html: string): number {
  * 源码行数算过一次，再数一次就把两行的段落估成三行。实测这两种写法的块一样高
  * （都是 94.3px），判据必须能把它们区分开。
  */
-const BLOCK_TAG_LINE_END =
-  /<(?:br\s*\/?|\/?(?:p|div|section|details|summary|figure|figcaption|h[1-6]|hr|ul|ol|li|dl|dt|dd|blockquote|pre|table|thead|tbody|tfoot|tr|th|td)\b[^>]*)>\n/g;
+const HARD_BREAK_LINE_END = /<br\s*\/?>/g;
 
 /**
- * 数出这一块里有多少个「空行盒」。
+ * 数出这一块里有多少个硬换行。
  *
- * `.cm-content` 的 `white-space: break-spaces` 会继承进块 widget，于是净化后
- * HTML 里每一个块级标签后面的换行都被原样保留成一次换行，各占一个 27.2px 的
- * 空行盒（详见文件顶部第 3 条）。markdown-it 的块级渲染器在每个块级标签后面
- * 都补一个换行，正好落在这个模式上。
- *
- * `<br>` 也算进来，它不是误伤：硬换行输出的是 `甲<br>\n乙`，`<br>` 断一次、
- * 后面那个换行在 break-spaces 下再断一次，两行文字实际占了三个行盒。实测
- * 这样一个块 121.5px（= 4 个行盒 + 内边距），漏掉 `<br>` 会低估 27px。
- *
- * 这一项不是可有可无的微调：一个三项列表有 5 个这样的换行（`<ul>` 后、每个
- * `</li>` 后、`</ul>` 后），合计 136px——不数的话整块被低估将近一半。
+ * 块 widget 是 `white-space: normal`（见 markdown.css「编辑器块 widget」一节），
+ * 因此 HTML 里块级标签后面那些换行会被折叠成空格、不产生行盒——那一项不必再数。
+ * 但 `<br>` 不同：它在 `normal` 下照样强制断行，`甲<br>乙` 实打实占两个行盒，
+ * 不数的话带硬换行的段落会被系统性低估，而低估是沿文档累积的。
  */
-function strayLineBoxes(html: string): number {
+function hardBreakLineBoxes(html: string): number {
   // 模块级的带 g 正则会记住 lastIndex，复用前必须归零
-  BLOCK_TAG_LINE_END.lastIndex = 0;
+  HARD_BREAK_LINE_END.lastIndex = 0;
   let count = 0;
-  while (BLOCK_TAG_LINE_END.exec(html) !== null) count++;
+  while (HARD_BREAK_LINE_END.exec(html) !== null) count++;
   return count;
 }
 
@@ -279,18 +267,18 @@ export function estimateBlockHeight(block: RenderedBlock): number {
    */
   if (html.startsWith('<pre')) {
     const lines = Math.max(1, block.endLine - block.startLine);
-    return lines * TEXT_LINE_PX + BLOCK_CHROME_PX;
+    return lines * TEXT_LINE_PX + WIDGET_PADDING_PX;
   }
 
   if (html.includes('<table')) {
     // 表头那一行也是 <tr>，所以直接数就够
     const rows = Math.max(1, countOccurrences(html, '<tr'));
-    return rows * TABLE_ROW_PX + BLOCK_CHROME_PX;
+    return rows * TABLE_ROW_PX + WIDGET_PADDING_PX;
   }
 
   // 图片：一块里可能有好几张，逐张累加；块里的文字另算
   const images = countOccurrences(html, '<img');
-  if (images > 0) return images * IMAGE_PX + BLOCK_CHROME_PX;
+  if (images > 0) return images * IMAGE_PX + WIDGET_PADDING_PX;
 
   const heading = /^<h([1-6])[\s>]/.exec(html);
   if (heading) {
@@ -300,10 +288,10 @@ export function estimateBlockHeight(block: RenderedBlock): number {
 
   /*
    * 其余按文字量折行估算，但不低于源码行数：列表、引用块、定义列表里
-   * 每一源码行至少占一行，哪怕每行只有两个字。再加上块内每个块级标签后面
-   * 那个换行占掉的空行盒——这一支是唯一会出现嵌套块级元素的地方。
+   * 每一源码行至少占一行，哪怕每行只有两个字。再加上块内的硬换行——
+   * `<br>` 在 `white-space: normal` 下照样强制断行，要单独计一个行盒。
    */
   const sourceLines = Math.max(1, block.endLine - block.startLine);
   const textLines = Math.max(wrappedLines(html), sourceLines);
-  return (textLines + strayLineBoxes(html)) * TEXT_LINE_PX + WIDGET_PADDING_PX;
+  return (textLines + hardBreakLineBoxes(html)) * TEXT_LINE_PX + WIDGET_PADDING_PX;
 }

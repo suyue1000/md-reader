@@ -56,19 +56,20 @@ describe('estimateBlockHeight', () => {
     expect(height).toBeLessThan(220);
   });
 
-  it('块级标签后面的换行各占一个空行盒，要算进高度', () => {
+  it('块级标签后面的换行不产生空行盒——widget 是 white-space: normal', () => {
     /*
-     * `.cm-content` 的 `white-space: break-spaces` 会继承进块 widget，净化后的
-     * HTML 里每个块级标签后面的换行都被保留成一次真实换行。三项列表因此比
-     * 「三行文字」高出整整 5 个行盒——不算这一项，列表块会被低估将近一半，
-     * 而低估是沿文档累积的，累到一定程度跳转就收敛不了。
+     * 回归：`markdown.css` 给 `.cm-md-block` 显式声明了 `white-space: normal`。
+     * 漏了这一句，`.cm-content` 的 `break-spaces` 就会继承进来，HTML 里每个
+     * 块级标签后面的换行都被保留成一次真实换行，三项列表会比「三行文字」
+     * 凭空高出 5 个行盒——每块都白白多一行，一篇 60 块的文档约 1600px 的死白。
+     * 这条守的是「HTML 带不带那些换行，估值完全一样」。
      */
     const items = '<li>甲</li>\n<li>乙</li>\n<li>丙</li>\n';
     const withBreaks = estimateBlockHeight(block(`<ul>\n${items}</ul>\n`, 0, 3));
     const withoutBreaks = estimateBlockHeight(
       block('<ul><li>甲</li><li>乙</li><li>丙</li></ul>', 0, 3),
     );
-    expect(withBreaks - withoutBreaks).toBeGreaterThan(ONE_LINE * 4);
+    expect(withBreaks).toBe(withoutBreaks);
   });
 
   it('段落内部的软换行不算空行盒，否则两行的段落会被估成四行', () => {
