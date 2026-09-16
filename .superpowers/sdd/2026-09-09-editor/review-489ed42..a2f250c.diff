@@ -1,0 +1,843 @@
+# Review package: 489ed42..HEAD
+
+## Commits
+a2f250c refactor: 阅读位置改为行号定位
+
+## Files changed
+ src/editor/MarkdownEditor.test.tsx |  18 +++-
+ src/editor/MarkdownEditor.tsx      |  17 +++-
+ src/hooks/useReadingPosition.ts    | 164 +++++++++++++------------------------
+ src/types/document.ts              |  18 ++--
+ src/utils/reading-position.test.ts | 143 +++++---------------------------
+ src/utils/reading-position.ts      |  67 ---------------
+ src/viewer/pages/ReaderPage.tsx    |  13 ++-
+ 7 files changed, 126 insertions(+), 314 deletions(-)
+
+## Diff
+diff --git a/src/editor/MarkdownEditor.test.tsx b/src/editor/MarkdownEditor.test.tsx
+index 59ac45f..0e0e232 100644
+--- a/src/editor/MarkdownEditor.test.tsx
++++ b/src/editor/MarkdownEditor.test.tsx
+@@ -1,12 +1,13 @@
+ import { render, screen, waitFor } from '@testing-library/react';
+-import { describe, expect, it } from 'vitest';
++import type { EditorView } from '@codemirror/view';
++import { describe, expect, it, vi } from 'vitest';
+ import { MarkdownEditor } from './MarkdownEditor';
+ 
+ /**
+  * 等待渲染管线就绪的上限。
+  *
+  * 组件挂载后要动态 import 整条 Markdown 管线并注册全部内置插件，
+  * vitest 下这是一次真实的模块转译，默认的 1s 不够用。
+  */
+ const READY_TIMEOUT = 15_000;
+ 
+@@ -35,11 +36,26 @@ describe('MarkdownEditor', () => {
+     await waitFor(
+       () => {
+         const heading = screen.getByRole('heading', { level: 1 });
+         expect(heading.textContent).toContain('乙');
+         // 旧文档必须真的消失，而不是新内容追加在后面
+         expect(heading.textContent).not.toContain('甲');
+       },
+       { timeout: READY_TIMEOUT },
+     );
+   });
++
++  it('创建后通过 onViewReady 暴露实例，卸载前传 null', async () => {
++    const onViewReady = vi.fn<(view: EditorView | null) => void>();
++    const { unmount } = render(
++      <MarkdownEditor value="# 你好" documentId="doc:a" readOnly onViewReady={onViewReady} />,
++    );
++
++    await waitFor(() => {
++      expect(onViewReady).toHaveBeenCalledTimes(1);
++      expect(onViewReady.mock.calls[0]?.[0]).not.toBeNull();
++    });
++
++    unmount();
++    expect(onViewReady).toHaveBeenLastCalledWith(null);
++  });
+ });
+diff --git a/src/editor/MarkdownEditor.tsx b/src/editor/MarkdownEditor.tsx
+index 2d7c485..39d4190 100644
+--- a/src/editor/MarkdownEditor.tsx
++++ b/src/editor/MarkdownEditor.tsx
+@@ -26,20 +26,29 @@ export interface MarkdownEditorProps {
+   /** 文档 id，变化表示换了文档，需要整体重建 */
+   documentId: string;
+   /** 相对链接基准 */
+   baseUrl?: string | undefined;
+   /** 是否只读 */
+   readOnly: boolean;
+   /** 文本变化（编辑态才会触发） */
+   onChange?: (value: string) => void;
+   /** 每轮块渲染完成后回调，携带带行号的标题 */
+   onHeadings?: (headings: readonly LineHeading[]) => void;
++  /**
++   * 编辑器实例就绪 / 销毁时回调。
++   *
++   * 阅读位置恢复要拿到 `EditorView` 才能换算行号与调用 `scrollToLine`，
++   * 而 view 是这个组件内部创建的，外部拿不到——用回调而不是把 view 存进
++   * state，是因为 view 的生命周期完全由这里的 effect 管理，state 只会
++   * 多一份要保持同步的副本。销毁前传 null，让外部及时丢掉失效的引用。
++   */
++  onViewReady?: (view: EditorView | null) => void;
+ }
+ 
+ /** 把视图滚动到指定的 0-based 行，供目录跳转与阅读位置恢复使用 */
+ export function scrollToLine(view: EditorView, line: number): void {
+   const target = view.state.doc.line(Math.min(line + 1, view.state.doc.lines));
+   view.dispatch({
+     effects: EditorView.scrollIntoView(target.from, { y: 'start' }),
+   });
+ }
+ 
+@@ -50,20 +59,21 @@ export function scrollToLine(view: EditorView, line: number): void {
+  * 可写状态。不存在第二条渲染路径，因此也不存在「阅读时看到的」和
+  * 「编辑时看到的」不一致的可能。
+  */
+ export function MarkdownEditor({
+   value,
+   documentId,
+   baseUrl,
+   readOnly,
+   onChange,
+   onHeadings,
++  onViewReady,
+ }: MarkdownEditorProps): React.JSX.Element {
+   const hostRef = useRef<HTMLDivElement>(null);
+   const viewRef = useRef<EditorView | null>(null);
+   const cacheRef = useRef<BlockCache | null>(null);
+   // useRef 的参数每次渲染都会求值，直接 useRef(createBlockCache()) 会在
+   // 每次重渲染时白建一个缓存再丢掉
+   cacheRef.current ??= createBlockCache();
+   /** 懒加载完成的渲染器；null 表示 Markdown 管线还在下载 */
+   const rendererRef = useRef<MarkdownRenderer | null>(null);
+   /** 由挂载 effect 装填：强制把已挂载的块重新增强一遍 */
+@@ -71,28 +81,28 @@ export function MarkdownEditor({
+   /**
+    * `editable` 与 `readOnly` 装在同一个 compartment 里一起切换。
+    *
+    * 两者必须成对设置，理由见 `live-preview.ts` 里 `buildDecorations` 上方的
+    * 说明：只设 `EditorState.readOnly` 的话视图仍可聚焦、仍有选区，光标所在
+    * 的那一块会当场变回源码，只读的阅读体验就破了。
+    */
+   const editModeRef = useRef(new Compartment());
+ 
+   // 用 ref 持有回调，避免它们变化就重建整个编辑器
+-  const callbacksRef = useRef({ onChange, onHeadings, baseUrl });
++  const callbacksRef = useRef({ onChange, onHeadings, onViewReady, baseUrl });
+   /*
+    * 同步写在 effect 里而不是渲染期间：渲染期间改 ref 是 React 明令禁止的。
+    * 这个 effect 声明在下面重建编辑器的 effect 之前，因此同一轮提交里它总是
+    * 先跑——重建时读到的回调一定是本轮的新值。
+    */
+   useEffect(() => {
+-    callbacksRef.current = { onChange, onHeadings, baseUrl };
++    callbacksRef.current = { onChange, onHeadings, onViewReady, baseUrl };
+   });
+ 
+   /**
+    * 只订阅会影响输出的设置分组。
+    *
+    * `markdown` 决定 HTML 结构（插件开关），变了必须整篇重来；
+    * `appearance` / `reading` 与**实际生效**的明暗主题只影响呈现——
+    * Shiki 的配色、Mermaid 的图都按主题生成，重跑一遍增强即可。
+    * 后者刻意不放进重建依赖：改个字号就把编辑器推倒重建太重了。
+    */
+@@ -162,20 +172,21 @@ export function MarkdownEditor({
+         callbacksRef.current.onChange?.(update.state.doc.toString());
+         scheduleRerender(update.view);
+       }),
+     ];
+ 
+     const view = new EditorView({ doc: value, extensions, parent: host });
+     viewRef.current = view;
+     reenhanceRef.current = () => {
+       enhanceMounted(view, true);
+     };
++    callbacksRef.current.onViewReady?.(view);
+ 
+     let cancelled = false;
+ 
+     if (rendererRef.current) {
+       // 管线早就就绪（换文档、改设置），首轮渲染同步完成，不会闪一眼源码
+       rerender(view);
+     } else {
+       /*
+        * 首次挂载要先把整条 Markdown 管线引导起来。
+        *
+@@ -198,20 +209,22 @@ export function MarkdownEditor({
+         } catch (error) {
+           log.error('Markdown 管线加载失败，正文将保持源码形态', error);
+         }
+       })();
+     }
+ 
+     return () => {
+       cancelled = true;
+       scheduleRerender.cancel();
+       reenhanceRef.current = null;
++      // 销毁前先通知外部——阅读位置 hook 靠这个信号丢掉即将失效的 view 引用
++      callbacksRef.current.onViewReady?.(null);
+       view.destroy();
+       viewRef.current = null;
+       cache.clear();
+     };
+     // value 只作为初始文档；后续内容变化由下面的 effect 处理
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [documentId, markdownSettings]);
+ 
+   // 只读态下外部内容变化（自动刷新）需要灌进编辑器
+   useEffect(() => {
+diff --git a/src/hooks/useReadingPosition.ts b/src/hooks/useReadingPosition.ts
+index c2db586..b3b6cff 100644
+--- a/src/hooks/useReadingPosition.ts
++++ b/src/hooks/useReadingPosition.ts
+@@ -1,136 +1,83 @@
+-import { useEffect, useLayoutEffect, useRef } from 'react';
++import { useEffect, useRef } from 'react';
++import type { EditorView } from '@codemirror/view';
++import { scrollToLine } from '@/editor/MarkdownEditor';
+ import { useScrollContainer } from '@/components/layout/ScrollContainerContext';
+ import { useSettingsStore } from '@/stores/settings.store';
+ import {
+-  computeRestoreTarget,
+-  findAnchorIndex,
+   flushReadingPositions,
+   hydrateReadingPositions,
+   recallPosition,
+   rememberPosition,
+ } from '@/utils/reading-position';
+ 
+ /** 保存位置的节流间隔 */
+ const SAVE_THROTTLE = 400;
+ 
+ export interface UseReadingPositionParams {
+   /** 当前文档 id */
+   documentId: string;
+-  /** 当前正文 HTML，作为「内容已换」的信号 */
+-  contentKey: string;
+-  /** DOM 增强完成的次数，用于在高度稳定后再校正一次位置 */
+-  enhancedToken: number;
++  /** 编辑器实例；未就绪（还没挂载或已卸载）时为 null */
++  view: EditorView | null;
+ }
+ 
+ /**
+  * 阅读位置的记录与恢复。
+  *
+- * 需要恢复位置的时机有三个，它们的共同点是「内容或布局刚刚变过」：
+- * 1. 打开一个以前读过的文档（跨会话恢复，受设置控制）；
+- * 2. 自动刷新后内容被替换（**不受设置控制**——刷新后跳回顶部是 bug，
+- *    不是可选偏好）；
+- * 3. DOM 增强完成后（Shiki 上色、Mermaid 出图会显著改变高度），
+- *    此时按同一个锚点再校正一次。
++ * 相比旧实现少了 `contentKey` 与 `enhancedToken` 两个参数——它们存在的
++ * 唯一理由是「等分块渲染插完、等 Shiki 与 Mermaid 改完高度」，而行号定位
++ * 根本不依赖高度，等待也就没有意义了。
+  *
+- * 定位方式是「锚点 + 相对偏移」：记下视口顶部上方最近的那个标题，
+- * 以及滚动位置相对它的像素差。这样文档上方新增或删除内容都不会让位置漂移，
+- * 而纯比例定位在自动刷新（常见于文末追加内容）时一定会偏。
++ * 记录与恢复都要把「容器的滚动像素」换算成「文档内的高度坐标」，两者的
++ * 原点不是同一个点：编辑器不自己滚动（`height: auto`），真正滚动的是外层
++ * `<main>`；而 CodeMirror 的 `documentTop` / `lineBlockAtHeight` 说的是
++ * 相对文档顶部（第一行的顶部，视口坐标）的距离。二者之差就是换算用的常量。
+  */
+-export function useReadingPosition({
+-  documentId,
+-  contentKey,
+-  enhancedToken,
+-}: UseReadingPositionParams): void {
++export function useReadingPosition({ documentId, view }: UseReadingPositionParams): void {
+   const container = useScrollContainer();
+   const shouldPersist = useSettingsStore((state) => state.settings.reading.restoreScrollPosition);
+ 
+-  /** 当前文档的标题元素与它们的偏移量，按文档顺序 */
+-  const anchorsRef = useRef<{ ids: string[]; offsets: number[] }>({ ids: [], offsets: [] });
+-  /** 上一次已恢复过的内容标识，避免同一份内容反复恢复 */
+-  const restoredKeyRef = useRef('');
+-  /**
+-   * 标记「下一次滚动事件是我们自己滚出来的」。
+-   *
+-   * 恢复位置会触发一次 scroll 事件，如果不加区分就会被当成用户滚动记录下来。
+-   * 这本身还不算大问题，真正的坑是**顺序**：内容替换后浏览器也会派发一次
+-   * 滚动事件，此时若先执行保存，就会用新布局去反算锚点，把正确的位置
+-   * 覆盖成错的，随后的恢复自然就回到了原来的像素位置——看起来像「没恢复」。
+-   */
+-  const programmaticScrollRef = useRef(false);
++  /** 已经为哪个文档恢复过位置，避免同一文档在设置项等无关变化下被反复恢复 */
++  const restoredDocRef = useRef<string | null>(null);
++  /** 恢复时用来追加像素偏移的那个 rAF，卸载时要能取消 */
++  const offsetFrameRef = useRef(0);
+ 
+   // 首次挂载时把存储里的记录读进内存缓存
+   useEffect(() => {
+     void hydrateReadingPositions();
+   }, []);
+ 
+-  // 内容变化后重建锚点索引。
+-  // 用 layout effect：它在 DOM 变更后、浏览器派发滚动事件之前同步执行，
+-  // 保证「重建索引 -> 恢复位置」这一对动作抢在任何滚动回调之前完成
+-  useLayoutEffect(() => {
+-    if (!container || contentKey === '') {
+-      anchorsRef.current = { ids: [], offsets: [] };
+-      return;
+-    }
+-    const headings = container.querySelectorAll<HTMLElement>(
+-      '.markdown-body h1[id], .markdown-body h2[id], .markdown-body h3[id], .markdown-body h4[id], .markdown-body h5[id], .markdown-body h6[id]',
+-    );
+-    const ids: string[] = [];
+-    const offsets: number[] = [];
+-    for (const heading of headings) {
+-      ids.push(heading.id);
+-      offsets.push(heading.offsetTop);
+-    }
+-    anchorsRef.current = { ids, offsets };
+-  }, [container, contentKey, enhancedToken]);
+-
+   // 滚动时记录位置
+   useEffect(() => {
+-    if (!container || documentId === '') return;
++    if (!container || !view || documentId === '') return;
+ 
+     let frame = 0;
+     let lastSavedAt = 0;
+ 
+     /**
+      * @param force 跳过节流。页面即将隐藏/关闭时必须立即落盘，
+      *              否则最后一段滚动会随着挂起的 rAF 一起丢掉
+      */
+     const save = (force = false): void => {
+       frame = 0;
+ 
+-      // 吃掉由恢复动作自己引发的那一次滚动事件
+-      if (programmaticScrollRef.current) {
+-        programmaticScrollRef.current = false;
+-        return;
+-      }
+-
+       const now = Date.now();
+       if (!force && now - lastSavedAt < SAVE_THROTTLE) return;
+       lastSavedAt = now;
+ 
+-      const { ids, offsets } = anchorsRef.current;
+-      const scrollTop = container.scrollTop;
+-      const scrollable = container.scrollHeight - container.clientHeight;
+-      const index = findAnchorIndex(offsets, scrollTop);
+-      const anchorId = index >= 0 ? (ids[index] ?? null) : null;
+-      const anchorOffset = index >= 0 ? scrollTop - (offsets[index] ?? 0) : 0;
+-
+-      rememberPosition(
+-        {
+-          documentId,
+-          ratio: scrollable > 0 ? scrollTop / scrollable : 0,
+-          anchorId,
+-          anchorOffset,
+-          updatedAt: now,
+-        },
+-        shouldPersist,
+-      );
++      // 容器可视区顶部相对文档顶部的距离，即当前应该记的「高度坐标」
++      const heightInDoc = Math.max(0, container.getBoundingClientRect().top - view.documentTop);
++      const block = view.lineBlockAtHeight(heightInDoc);
++      const line = view.state.doc.lineAt(block.from).number - 1;
++      const offset = Math.max(0, heightInDoc - block.top);
++
++      rememberPosition({ documentId, line, offset, updatedAt: now }, shouldPersist);
+     };
+ 
+     const onScroll = (): void => {
+       // 用 rAF 而不是直接保存：滚动事件每帧可能来好几次，
+       // 而 rAF 天然把一帧内的多次触发合并成一次。
+       // 必须包一层箭头函数——rAF 会把时间戳作为首个参数传入，
+       // 直接传 save 会让恒为真的时间戳变成 force，把节流整个绕过
+       if (frame === 0) frame = requestAnimationFrame(() => save());
+     };
+ 
+@@ -157,48 +104,49 @@ export function useReadingPosition({
+     container.addEventListener('scroll', onScroll, { passive: true });
+     document.addEventListener('visibilitychange', onVisibilityChange);
+     window.addEventListener('pagehide', flush);
+ 
+     return () => {
+       container.removeEventListener('scroll', onScroll);
+       document.removeEventListener('visibilitychange', onVisibilityChange);
+       window.removeEventListener('pagehide', flush);
+       if (frame !== 0) cancelAnimationFrame(frame);
+     };
+-  }, [container, documentId, shouldPersist]);
++  }, [container, view, documentId, shouldPersist]);
+ 
+-  // 内容或布局变化后恢复位置（同样用 layout effect，理由见上）
+-  useLayoutEffect(() => {
+-    if (!container || documentId === '' || contentKey === '') return;
++  // 文档就绪后恢复位置一次（受设置控制——这是「跨会话恢复」，可以关掉）
++  useEffect(() => {
++    if (!container || !view || documentId === '' || !shouldPersist) return;
++    // 只在这个文档还没恢复过时动手，避免设置项变化之类的重渲染把用户重新拽走
++    if (restoredDocRef.current === documentId) return;
+ 
+     const position = recallPosition(documentId);
+     if (!position) return;
+-
+-    // 首次加载某文档时，只有开启了「恢复阅读位置」才跳转；
+-    // 而内容被替换（自动刷新）时无条件恢复——这不是偏好，是正确性
+-    const isFirstRestoreForDocument = restoredKeyRef.current === '';
+-    if (isFirstRestoreForDocument && !shouldPersist) {
+-      restoredKeyRef.current = contentKey;
+-      return;
++    restoredDocRef.current = documentId;
++
++    scrollToLine(view, position.line);
++    if (position.offset > 0) {
++      /*
++       * scrollToLine 派发的是 CodeMirror 的 scrollIntoView 效果，实际滚动
++       * 发生在下一个 rAF 里的测量阶段（见 EditorView.measure）。这里的像素
++       * 偏移必须叠加在那次滚动**之后**，所以同样排到 rAF——由于两者都在
++       * 本轮同步代码里调度，浏览器会按注册顺序执行，CM 的测量一定先跑完。
++       */
++      offsetFrameRef.current = requestAnimationFrame(() => {
++        offsetFrameRef.current = 0;
++        container.scrollTop += position.offset;
++      });
+     }
+-    restoredKeyRef.current = contentKey;
+-
+-    const top = computeRestoreTarget(
+-      position,
+-      anchorsRef.current,
+-      container.scrollHeight - container.clientHeight,
+-    );
+-    // 目标位置与当前位置一致时不要滚——否则不会产生 scroll 事件，
+-    // programmaticScrollRef 会一直挂着，把用户接下来的真实滚动吃掉一次
+-    if (Math.abs(container.scrollTop - top) <= 1) return;
+-
+-    programmaticScrollRef.current = true;
+-    // 用 instant 而不是 smooth：这是「恢复」而不是「导航」，
+-    // 平滑滚动会让用户看到一段莫名其妙的动画
+-    container.scrollTo({ top, behavior: 'instant' });
+-  }, [container, documentId, contentKey, enhancedToken, shouldPersist]);
+-
+-  // 换文档时重置「是否已恢复过」的标记
++  }, [container, view, documentId, shouldPersist]);
++
++  // 换文档时重置「是否已恢复过」的标记，允许在新文档上再次恢复
+   useEffect(() => {
+-    restoredKeyRef.current = '';
++    restoredDocRef.current = null;
+   }, [documentId]);
++
++  // 卸载时别留下悬挂的 rAF
++  useEffect(() => {
++    return () => {
++      if (offsetFrameRef.current !== 0) cancelAnimationFrame(offsetFrameRef.current);
++    };
++  }, []);
+ }
+diff --git a/src/types/document.ts b/src/types/document.ts
+index 4aec1fd..6774738 100644
+--- a/src/types/document.ts
++++ b/src/types/document.ts
+@@ -76,33 +76,31 @@ export type WatchStatus =
+   /** 正在轮询 */
+   | 'watching'
+   /** 标签页不可见，已暂停轮询 */
+   | 'paused'
+   /** 文件不见了或权限被撤销，已停止 */
+   | 'stopped';
+ 
+ /**
+  * 单个文档的阅读状态。
+  *
+- * 同时记录锚点与比例，是因为两者各有失效场景：
+- * - 纯比例在文档长度变化后会偏移（自动刷新最常见的就是文末追加内容）；
+- * - 纯锚点丢失了章节内部的位置，且文档无标题时完全不可用。
+- * 优先用「锚点 + 相对锚点的像素偏移」，锚点找不到时回落到比例。
++ * 记录行号而不是锚点 + 比例：编辑器的文档模型本身就是按行寻址的，行号
++ * 是天然稳定的坐标。旧方案要靠「锚点 + 像素偏移 + 比例」三重兜底，是因为
++ * 渲染后的 DOM 没有一个稳定的坐标系——标题会被改、高度会随字号变。
++ * 行号没有这些问题：改了第 100 行之后的内容，第 50 行还是第 50 行。
+  */
+ export interface ReadingPosition {
+   documentId: string;
+-  /** 滚动百分比 0~1，锚点失效时的兜底 */
+-  ratio: number;
+-  /** 视口顶部上方最近的标题锚点 */
+-  anchorId: string | null;
+-  /** 滚动位置相对该锚点顶部的像素偏移 */
+-  anchorOffset: number;
++  /** 0-based 行号 */
++  line: number;
++  /** 该行在视口中的像素偏移，用于长行的精确还原 */
++  offset: number;
+   updatedAt: number;
+ }
+ 
+ /** 最近打开记录 */
+ export interface RecentFileEntry {
+   id: string;
+   name: string;
+   path: string;
+   openedAt: number;
+ }
+diff --git a/src/utils/reading-position.test.ts b/src/utils/reading-position.test.ts
+index 4c4d0c3..df0b303 100644
+--- a/src/utils/reading-position.test.ts
++++ b/src/utils/reading-position.test.ts
+@@ -1,153 +1,40 @@
+ import { beforeEach, describe, expect, it, vi } from 'vitest';
+ import {
+   clearReadingPositions,
+-  computeRestoreTarget,
+-  findAnchorIndex,
++  flushReadingPositions,
++  hydrateReadingPositions,
+   recallPosition,
+   rememberPosition,
+ } from './reading-position';
+ import { createMemoryStorageDriver, setStorageDriver } from './storage';
+ import type { ReadingPosition } from '@/types';
+ 
+ /** 构造一条位置记录 */
+ function makePosition(documentId: string, updatedAt = Date.now()): ReadingPosition {
+-  return { documentId, ratio: 0.5, anchorId: 'h1', anchorOffset: 20, updatedAt };
++  return { documentId, line: 42, offset: 8, updatedAt };
+ }
+ 
+-describe('findAnchorIndex', () => {
+-  const offsets = [0, 100, 250, 900, 1500];
+-
+-  it('返回最后一个不超过滚动位置的下标', () => {
+-    expect(findAnchorIndex(offsets, 260)).toBe(2);
+-    expect(findAnchorIndex(offsets, 900)).toBe(3);
+-    expect(findAnchorIndex(offsets, 99999)).toBe(4);
+-  });
+-
+-  it('正好落在某个标题上时命中该标题', () => {
+-    expect(findAnchorIndex(offsets, 250)).toBe(2);
+-  });
+-
+-  it('滚动位置在第一个标题之上时返回 -1', () => {
+-    expect(findAnchorIndex([100, 200], 50)).toBe(-1);
+-  });
+-
+-  it('空数组返回 -1', () => {
+-    expect(findAnchorIndex([], 100)).toBe(-1);
+-  });
+-
+-  it('与线性扫描的结果一致（随机对照）', () => {
+-    // 二分容易在边界上写错，用朴素实现做交叉验证
+-    const random = Array.from({ length: 200 }, (_, i) => i * 37);
+-    for (const probe of [0, 1, 36, 37, 3699, 7400, 99999]) {
+-      const linear = random.reduce((acc, offset, index) => (offset <= probe ? index : acc), -1);
+-      expect(findAnchorIndex(random, probe)).toBe(linear);
+-    }
+-  });
+-});
+-
+-describe('computeRestoreTarget', () => {
+-  /** 三个标题的文档 */
+-  const anchors = { ids: ['intro', 'usage', 'api'], offsets: [0, 800, 1600] };
+-
+-  it('锚点未移动时回到原位', () => {
+-    const position: ReadingPosition = {
+-      documentId: 'doc',
+-      ratio: 0.5,
+-      anchorId: 'usage',
+-      anchorOffset: 120,
+-      updatedAt: 0,
+-    };
+-    expect(computeRestoreTarget(position, anchors, 3000)).toBe(920);
+-  });
+-
+-  it('锚点上方新增内容后跟着锚点走', () => {
+-    // 自动刷新最常见的情形：文档上方被追加了内容，所有锚点整体下移
+-    const position: ReadingPosition = {
+-      documentId: 'doc',
+-      ratio: 0.26,
+-      anchorId: 'usage',
+-      anchorOffset: 120,
+-      updatedAt: 0,
+-    };
+-    const shifted = { ids: ['intro', 'usage', 'api'], offsets: [0, 2000, 2800] };
+-
+-    // 若按比例定位会落在 ~1100，只有按锚点才能回到用户原来读的那一段
+-    expect(computeRestoreTarget(position, shifted, 4200)).toBe(2120);
+-  });
+-
+-  it('锚点上方内容被删除后同样跟随', () => {
+-    const position: ReadingPosition = {
+-      documentId: 'doc',
+-      ratio: 0.5,
+-      anchorId: 'api',
+-      anchorOffset: 50,
+-      updatedAt: 0,
+-    };
+-    const shrunk = { ids: ['intro', 'usage', 'api'], offsets: [0, 300, 700] };
+-    expect(computeRestoreTarget(position, shrunk, 2000)).toBe(750);
+-  });
+-
+-  it('锚点已消失时回落到比例定位', () => {
+-    const position: ReadingPosition = {
+-      documentId: 'doc',
+-      ratio: 0.5,
+-      anchorId: 'removed-heading',
+-      anchorOffset: 120,
+-      updatedAt: 0,
+-    };
+-    expect(computeRestoreTarget(position, anchors, 3000)).toBe(1500);
+-  });
+-
+-  it('保存时就在首个标题之上时按比例定位', () => {
+-    const position: ReadingPosition = {
+-      documentId: 'doc',
+-      ratio: 0.1,
+-      anchorId: null,
+-      anchorOffset: 0,
+-      updatedAt: 0,
+-    };
+-    expect(computeRestoreTarget(position, anchors, 2000)).toBe(200);
+-  });
+-
+-  it('结果不会为负', () => {
+-    const position: ReadingPosition = {
+-      documentId: 'doc',
+-      ratio: 0.5,
+-      anchorId: 'intro',
+-      anchorOffset: -500,
+-      updatedAt: 0,
+-    };
+-    expect(computeRestoreTarget(position, anchors, 1000)).toBe(0);
+-  });
+-
+-  it('文档变得不可滚动时回到顶部', () => {
+-    const position: ReadingPosition = {
+-      documentId: 'doc',
+-      ratio: 0.8,
+-      anchorId: null,
+-      anchorOffset: 0,
+-      updatedAt: 0,
+-    };
+-    expect(computeRestoreTarget(position, { ids: [], offsets: [] }, -10)).toBe(0);
+-  });
+-});
+-
+ describe('阅读位置缓存', () => {
+   beforeEach(() => {
+     setStorageDriver(createMemoryStorageDriver());
+     clearReadingPositions();
+   });
+ 
+   it('记录后可以读回', () => {
+     rememberPosition(makePosition('doc:a'), false);
+-    expect(recallPosition('doc:a')?.anchorId).toBe('h1');
++    expect(recallPosition('doc:a')?.line).toBe(42);
++  });
++
++  it('记录与读回行号', () => {
++    rememberPosition({ documentId: 'doc:a', line: 42, offset: 8, updatedAt: Date.now() }, false);
++    expect(recallPosition('doc:a')?.line).toBe(42);
+   });
+ 
+   it('未记录的文档返回 undefined', () => {
+     expect(recallPosition('doc:missing')).toBeUndefined();
+   });
+ 
+   it('关闭持久化时仍然更新内存缓存', () => {
+     // 自动刷新后要把用户放回原处，这与「跨会话恢复」是否开启无关
+     rememberPosition(makePosition('doc:b'), false);
+     expect(recallPosition('doc:b')).toBeDefined();
+@@ -165,11 +52,23 @@ describe('阅读位置缓存', () => {
+     expect(recallPosition('doc:4')).toBeUndefined();
+     expect(recallPosition('doc:5')).toBeDefined();
+     expect(recallPosition('doc:204')).toBeDefined();
+   });
+ 
+   it('清空后读不到任何记录', () => {
+     rememberPosition(makePosition('doc:c'), false);
+     clearReadingPositions();
+     expect(recallPosition('doc:c')).toBeUndefined();
+   });
++
++  it('hydrate 后不覆盖本次会话中已经产生的更新', async () => {
++    // 存储恢复只补空位，不能拿旧数据覆盖同一会话里更新过的记录
++    rememberPosition({ documentId: 'doc:d', line: 5, offset: 0, updatedAt: Date.now() }, false);
++    await hydrateReadingPositions();
++    expect(recallPosition('doc:d')?.line).toBe(5);
++  });
++
++  it('flush 不抛出', () => {
++    rememberPosition(makePosition('doc:e'), true);
++    expect(() => flushReadingPositions()).not.toThrow();
++  });
+ });
+diff --git a/src/utils/reading-position.ts b/src/utils/reading-position.ts
+index 6977079..e6c5831 100644
+--- a/src/utils/reading-position.ts
++++ b/src/utils/reading-position.ts
+@@ -73,84 +73,17 @@ export function recallPosition(documentId: string): ReadingPosition | undefined
+ /**
+  * 立即把挂起的写入落盘。
+  *
+  * 写盘本身是防抖的（800ms），页面关闭时那 800ms 等不到——
+  * 必须在 `pagehide` 之类的时机手动催一次。
+  */
+ export function flushReadingPositions(): void {
+   persist.flush();
+ }
+ 
+-/**
+- * 在有序的标题偏移量数组里，找出最后一个不超过当前滚动位置的标题下标。
+- *
+- * 用二分而不是线性扫描：保存位置是滚动过程中的高频操作，几百个标题时
+- * 线性扫描累加起来会吃掉可观的主线程时间。标题的 `offsetTop` 天然按
+- * 文档顺序递增，正好满足二分的前提。
+- *
+- * @returns 命中的下标；滚动位置在第一个标题之上时返回 -1
+- */
+-export function findAnchorIndex(offsets: readonly number[], scrollTop: number): number {
+-  let low = 0;
+-  let high = offsets.length - 1;
+-  let found = -1;
+-
+-  while (low <= high) {
+-    const mid = (low + high) >> 1;
+-    const offset = offsets[mid];
+-    if (offset === undefined) break;
+-    if (offset <= scrollTop) {
+-      found = mid;
+-      low = mid + 1;
+-    } else {
+-      high = mid - 1;
+-    }
+-  }
+-
+-  return found;
+-}
+-
+-/** 一份文档的标题锚点索引 */
+-export interface AnchorIndex {
+-  /** 标题 id，按文档顺序 */
+-  ids: readonly string[];
+-  /** 对应的 offsetTop，与 ids 一一对应且递增 */
+-  offsets: readonly number[];
+-}
+-
+-/**
+- * 计算应该滚动到的位置。
+- *
+- * 这是整个阅读位置功能的核心判断，也是唯一容易出错的地方，所以抽成纯函数：
+- * - **锚点仍在**：用「锚点当前的 offsetTop + 保存时的相对偏移」。
+- *   这样即使锚点上方新增或删除了内容（自动刷新最常见的情形），
+- *   用户看到的仍然是原来那一段文字；
+- * - **锚点已消失**（标题被删或改名）：回落到比例定位，虽不精确但不会跳到顶部；
+- * - **保存时就在首个标题之上**：按比例定位。
+- *
+- * @param position 保存的位置
+- * @param anchors 当前文档的锚点索引
+- * @param scrollable 可滚动高度（scrollHeight - clientHeight）
+- * @returns 目标 scrollTop，已裁剪为非负
+- */
+-export function computeRestoreTarget(
+-  position: ReadingPosition,
+-  anchors: AnchorIndex,
+-  scrollable: number,
+-): number {
+-  const anchorIndex = position.anchorId ? anchors.ids.indexOf(position.anchorId) : -1;
+-
+-  const target =
+-    anchorIndex >= 0
+-      ? (anchors.offsets[anchorIndex] ?? 0) + position.anchorOffset
+-      : position.ratio * Math.max(0, scrollable);
+-
+-  return Math.max(0, target);
+-}
+-
+ /** 清空全部记录（测试与「恢复默认」用） */
+ export function clearReadingPositions(): void {
+   cache.clear();
+   hydrated = false;
+   persist.cancel();
+   void writeValue(STORAGE_AREAS.readingPositions, STORAGE_KEYS.readingPositions, {});
+ }
+diff --git a/src/viewer/pages/ReaderPage.tsx b/src/viewer/pages/ReaderPage.tsx
+index 9e8e3d5..c7e3391 100644
+--- a/src/viewer/pages/ReaderPage.tsx
++++ b/src/viewer/pages/ReaderPage.tsx
+@@ -1,11 +1,12 @@
+ import { useCallback, useState } from 'react';
++import type { EditorView } from '@codemirror/view';
+ import { AlertCircle, FileText } from 'lucide-react';
+ import type { LineHeading } from '@/editor/block-render';
+ import { MarkdownEditor } from '@/editor/MarkdownEditor';
+ import { buildTocTree } from '@/markdown/toc';
+ import { useDocumentStore } from '@/stores/document.store';
+ import { useAutoRefresh } from '@/hooks/useAutoRefresh';
+ import { useOpenFile } from '@/hooks/useOpenFile';
+ import { usePendingAnchor } from '@/hooks/usePendingAnchor';
+ import { useReadingPosition } from '@/hooks/useReadingPosition';
+ import { useRelativeLinks } from '@/hooks/useRelativeLinks';
+@@ -61,51 +62,55 @@ function ErrorState({ message }: { message: string }): React.JSX.Element {
+ export function ReaderPage(): React.JSX.Element {
+   const doc = useDocumentStore((state) => state.document);
+   const documentId = useDocumentStore((state) => state.document?.id ?? '');
+   const status = useDocumentStore((state) => state.status);
+   const storeError = useDocumentStore((state) => state.error);
+   const setToc = useDocumentStore((state) => state.setToc);
+ 
+   /**
+    * 块渲染完成的计数。
+    *
+-   * 这是一座**临时桥**：滚动同步、阅读位置、锚点跳转三个 hook 目前还是
+-   * 按「内容标识 + 增强完成信号」设计的，而分块渲染已经不存在了。
+-   * 后续任务会把它们改成基于行号定位，届时这个 token 连同这段注释一起删掉。
++   * 这是一座**临时桥**：滚动同步（`useScrollSpy`）与锚点跳转
++   * （`usePendingAnchor`）两个 hook 目前还是按「内容标识 + 增强完成信号」
++   * 设计的，而分块渲染已经不存在了。阅读位置已经改成基于行号定位、不再
++   * 需要这个 token；等这两个 hook 也改完，token 连同这段注释一起删掉。
+    */
+   const [renderToken, setRenderToken] = useState(0);
++  /** 正文编辑器实例；阅读位置恢复要用它换算行号与滚动 */
++  const [view, setView] = useState<EditorView | null>(null);
+ 
+   /** 编辑器每渲染完一轮块就把带行号的标题送过来，折叠成树写进 store */
+   const handleHeadings = useCallback(
+     (headings: readonly LineHeading[]) => {
+       setToc(buildTocTree(headings));
+       setRenderToken((n) => n + 1);
+     },
+     [setToc],
+   );
+ 
+   const contentKey = `${documentId}:${String(renderToken)}`;
+ 
+   // 目录高亮跟随滚动；放在这里是因为它需要 AppShell 提供的滚动容器上下文
+   useScrollSpy(contentKey);
+   useAutoRefresh();
+-  useReadingPosition({ documentId, contentKey, enhancedToken: renderToken });
++  useReadingPosition({ documentId, view });
+   // 放在阅读位置恢复之后：带锚点打开时，锚点说了算
+   usePendingAnchor(renderToken > 0);
+   useRelativeLinks();
+ 
+   if (status === 'error' && storeError) return <ErrorState message={storeError} />;
+   if (!doc) return <EmptyState />;
+ 
+   return (
+     // 版心与内边距由 editorTheme 的 .cm-content 负责，这里再套一层会叠加两层版心
+     <article className="app-article">
+       <MarkdownEditor
+         value={doc.content}
+         documentId={doc.id}
+         baseUrl={doc.baseUrl}
+         readOnly
+         onHeadings={handleHeadings}
++        onViewReady={setView}
+       />
+     </article>
+   );
+ }

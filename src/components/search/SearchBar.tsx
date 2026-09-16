@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react';
 import { ChevronDown, ChevronUp, Search, X } from 'lucide-react';
 import { useSearch } from '@/hooks/useSearch';
 import { useUiStore } from '@/stores/ui.store';
-import { supportsHighlightApi } from '@/search/highlight';
+import { supportsHighlightApi } from '@/search/block-highlight';
 
 /** 查找条里的小圆按钮 */
 function BarButton({

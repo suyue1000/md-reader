@@ -1,6 +1,7 @@
 import { AppearanceSection } from './sections/AppearanceSection';
 import { MarkdownSection } from './sections/MarkdownSection';
 import { ReadingSection } from './sections/ReadingSection';
+import { EditorSection } from './sections/EditorSection';
 import { AdvancedSection } from './sections/AdvancedSection';
 
 /**
@@ -16,6 +17,7 @@ export function SettingsPanel(): React.JSX.Element {
       <AppearanceSection />
       <MarkdownSection />
       <ReadingSection />
+      <EditorSection />
       <AdvancedSection />
     </div>
   );

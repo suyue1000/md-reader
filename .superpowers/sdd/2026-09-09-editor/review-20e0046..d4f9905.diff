@@ -1,0 +1,644 @@
+# Review package: 20e0046..HEAD
+
+## Commits
+d4f9905 fix: 锚点跳转优先于阅读位置恢复，到底判据抽成纯函数
+
+## Files changed
+ src/hooks/usePendingAnchor.test.tsx   | 138 ++++++++++++++++++++++++++++++++++
+ src/hooks/useReadingPosition.test.tsx | 128 +++++++++++++++++++++++++++++++
+ src/hooks/useReadingPosition.ts       |  44 ++++++++++-
+ src/hooks/useScrollSpy.ts             |  31 ++++++--
+ src/utils/scroll-math.test.ts         |  44 ++++++++++-
+ src/utils/scroll-math.ts              |  30 ++++++++
+ 6 files changed, 403 insertions(+), 12 deletions(-)
+
+## Diff
+diff --git a/src/hooks/usePendingAnchor.test.tsx b/src/hooks/usePendingAnchor.test.tsx
+new file mode 100644
+index 0000000..b786d9b
+--- /dev/null
++++ b/src/hooks/usePendingAnchor.test.tsx
+@@ -0,0 +1,138 @@
++import { act, render } from '@testing-library/react';
++import type { EditorView } from '@codemirror/view';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { buildTocTree } from '@/markdown/toc';
++import { useDocumentStore } from '@/stores/document.store';
++import type { MarkdownDocument } from '@/types';
++import { usePendingAnchor } from './usePendingAnchor';
++
++/** 只替换 scrollToLine：跳没跳、跳到第几行，是这个 hook 的全部可观察行为 */
++const scrollToLine = vi.fn();
++vi.mock('@/editor/MarkdownEditor', () => ({
++  scrollToLine: (view: EditorView, line: number): void => {
++    scrollToLine(view, line);
++  },
++}));
++
++const TOC = buildTocTree([
++  { id: '开篇', text: '开篇', level: 1, line: 0 },
++  { id: '第二节', text: '第二节', level: 2, line: 37 },
++]);
++
++function doc(id: string): MarkdownDocument {
++  return {
++    id,
++    name: `${id}.md`,
++    path: `/${id}.md`,
++    content: '',
++    size: 0,
++    lastModified: 0,
++    source: 'url',
++  };
++}
++
++let view: EditorView | null;
++
++function Probe(): null {
++  usePendingAnchor(view);
++  return null;
++}
++
++function mount(): { rerender: () => void } {
++  const { rerender } = render(<Probe />);
++  return { rerender: () => rerender(<Probe />) };
++}
++
++beforeEach(() => {
++  scrollToLine.mockClear();
++  view = { dom: document.body } as unknown as EditorView;
++  useDocumentStore.getState().reset();
++  useDocumentStore.getState().setPendingAnchor(null);
++});
++
++afterEach(() => {
++  useDocumentStore.getState().setPendingAnchor(null);
++});
++
++describe('usePendingAnchor', () => {
++  it('目录到齐后按行号跳转，并把锚点清掉', () => {
++    useDocumentStore.getState().setToc(TOC);
++    useDocumentStore.getState().setPendingAnchor('第二节');
++
++    mount();
++
++    expect(scrollToLine).toHaveBeenCalledWith(view, 37);
++    expect(useDocumentStore.getState().pendingAnchor).toBeNull();
++  });
++
++  it('目录还没到齐时什么都不做，尤其不能把锚点清掉', () => {
++    /*
++     * 缺陷 C 的守卫。换文档那一轮提交里目录已被清空、而 view 还指着上一篇
++     * 文档的实例；此时若按「查不到就算跳过了」处理，锚点会在新文档还没渲染
++     * 出来之前就被吃掉，表现是带锚点换文档永远停在顶部。
++     */
++    useDocumentStore.getState().setPendingAnchor('第二节');
++
++    mount();
++
++    expect(scrollToLine).not.toHaveBeenCalled();
++    expect(useDocumentStore.getState().pendingAnchor).toBe('第二节');
++  });
++
++  it('目录随后到齐时补上这次跳转', () => {
++    // 承接上一条：不清掉，是为了留到目录到齐后还能兑现
++    useDocumentStore.getState().setPendingAnchor('第二节');
++    mount();
++    expect(scrollToLine).not.toHaveBeenCalled();
++
++    act(() => {
++      useDocumentStore.getState().setToc(TOC);
++    });
++
++    expect(scrollToLine).toHaveBeenCalledWith(view, 37);
++    expect(useDocumentStore.getState().pendingAnchor).toBeNull();
++  });
++
++  it('编辑器未就绪时不动手', () => {
++    view = null;
++    useDocumentStore.getState().setToc(TOC);
++    useDocumentStore.getState().setPendingAnchor('第二节');
++
++    mount();
++
++    expect(scrollToLine).not.toHaveBeenCalled();
++    expect(useDocumentStore.getState().pendingAnchor).toBe('第二节');
++  });
++
++  it('锚点指向不存在的标题时清掉，不滚动', () => {
++    // 留着会让之后每一轮块渲染都白试一遍
++    useDocumentStore.getState().setToc(TOC);
++    useDocumentStore.getState().setPendingAnchor('这个标题不存在');
++
++    mount();
++
++    expect(scrollToLine).not.toHaveBeenCalled();
++    expect(useDocumentStore.getState().pendingAnchor).toBeNull();
++  });
++});
++
++describe('setDocument 与待跳转锚点', () => {
++  it('换文档时清掉上一篇没能消费的锚点', () => {
++    /*
++     * 「目录为空就不消费」留下的唯一残留：一篇没有任何标题的文档，锚点会
++     * 一直挂着。不在换文档时清掉的话，它会在下一篇文档上被莫名其妙地兑现。
++     */
++    useDocumentStore.getState().setPendingAnchor('上一篇的锚点');
++    useDocumentStore.getState().setDocument(doc('下一篇'));
++
++    expect(useDocumentStore.getState().pendingAnchor).toBeNull();
++  });
++
++  it('带锚点打开的正常时序（先 setDocument 再 setPendingAnchor）不受影响', () => {
++    // useEmbeddedDocument 就是这个顺序，本次的锚点必须活下来
++    useDocumentStore.getState().setDocument(doc('某篇'));
++    useDocumentStore.getState().setPendingAnchor('某个标题');
++
++    expect(useDocumentStore.getState().pendingAnchor).toBe('某个标题');
++  });
++});
+diff --git a/src/hooks/useReadingPosition.test.tsx b/src/hooks/useReadingPosition.test.tsx
+new file mode 100644
+index 0000000..366af21
+--- /dev/null
++++ b/src/hooks/useReadingPosition.test.tsx
+@@ -0,0 +1,128 @@
++import { act, fireEvent, render, screen } from '@testing-library/react';
++import type { EditorView } from '@codemirror/view';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { ScrollContainerProvider } from '@/components/layout/ScrollContainerContext';
++import { useDocumentStore } from '@/stores/document.store';
++import { rememberPosition } from '@/utils/reading-position';
++import { useReadingPosition } from './useReadingPosition';
++
++/*
++ * 只替换 `scrollToLine`：恢复位置这条路径上，「有没有把用户拽走」完全等价于
++ * 「有没有调它」。起一个真实的 EditorView 需要完整布局，在 jsdom 里量不出
++ * 任何东西，反而会把断言埋进一堆与本用例无关的测量代码里。
++ */
++const scrollToLine = vi.fn();
++vi.mock('@/editor/MarkdownEditor', () => ({
++  scrollToLine: (view: EditorView, line: number): void => {
++    scrollToLine(view, line);
++  },
++}));
++
++const DOC_ID = 'doc:已经读过的文档';
++/** 上次读到的行，用来和锚点行区分开 */
++const SAVED_LINE = 42;
++
++let container: HTMLElement;
++let view: EditorView;
++
++/**
++ * `onEnhanced` 挂在按钮上再点，而不是把它赋给一个外层变量。
++ *
++ * 渲染期给组件外的变量赋值是 React 明令禁止的副作用（lint 也会拦），
++ * 而「点一下触发增强完成」本来就更接近真实调用方的形态。
++ */
++function Probe(): React.JSX.Element {
++  const { onEnhanced } = useReadingPosition({ documentId: DOC_ID, view });
++  return <button type="button" data-testid="enhanced" onClick={onEnhanced} />;
++}
++
++/** 挂载被测 hook；`ScrollContainerProvider` 提供它需要的滚动容器 */
++function mount(): { rerender: () => void } {
++  const tree = (): React.JSX.Element => (
++    <ScrollContainerProvider value={container}>
++      <Probe />
++    </ScrollContainerProvider>
++  );
++  const { rerender } = render(tree());
++  return { rerender: () => rerender(tree()) };
++}
++
++beforeEach(() => {
++  scrollToLine.mockClear();
++
++  container = document.createElement('div');
++  document.body.append(container);
++  // hook 只把 view 当作 scrollToLine 的实参传出去，这里不需要真的编辑器
++  view = { dom: container } as unknown as EditorView;
++
++  // 这篇文档「上次读到第 42 行」。offset 非 0，用来暴露「行内偏移被叠到
++  // 锚点落点上」那一种更隐蔽的干扰
++  rememberPosition({ documentId: DOC_ID, line: SAVED_LINE, offset: 7, updatedAt: Date.now() }, false);
++  useDocumentStore.getState().setPendingAnchor(null);
++});
++
++afterEach(() => {
++  container.remove();
++  useDocumentStore.getState().setPendingAnchor(null);
++});
++
++describe('useReadingPosition 与待跳转锚点的优先级', () => {
++  it('没有锚点时，照常恢复上次阅读位置', () => {
++    // 正向对照：证明下面几个「没有恢复」不是因为恢复这条路本来就不通
++    mount();
++    expect(scrollToLine).toHaveBeenCalledWith(view, SAVED_LINE);
++  });
++
++  it('带锚点打开时不恢复阅读位置，把落点让给锚点', () => {
++    useDocumentStore.getState().setPendingAnchor('某个标题');
++    mount();
++    expect(scrollToLine).not.toHaveBeenCalled();
++  });
++
++  it('锚点被消费清空之后，也不能补一次恢复', () => {
++    /*
++     * 这是闩锁存在的理由。`pendingAnchor` 消费一次即清空，而清空本身会让
++     * 恢复那条 effect 的依赖发生变化、于是**立刻重跑一遍**——只看当下的
++     * `pendingAnchor` 是拦不住的，那一刻它已经是 null 了。
++     */
++    useDocumentStore.getState().setPendingAnchor('某个标题');
++    mount();
++    expect(scrollToLine).not.toHaveBeenCalled();
++
++    // 模拟 usePendingAnchor 跳完之后把锚点清掉
++    act(() => {
++      useDocumentStore.getState().setPendingAnchor(null);
++    });
++
++    expect(scrollToLine).not.toHaveBeenCalled();
++  });
++
++  it('增强完成后的校正也不能把用户从锚点拽回上次位置', () => {
++    /*
++     * 最要命的一种：Shiki 上色 / Mermaid 出图结束在锚点跳转之后好几秒，
++     * `onEnhanced` 那次校正会把已经停在锚点上的用户拽走。
++     * `userScrolledRef` 拦不住——锚点跳转本身就是程序化滚动。
++     */
++    useDocumentStore.getState().setPendingAnchor('某个标题');
++    mount();
++    act(() => {
++      useDocumentStore.getState().setPendingAnchor(null);
++    });
++
++    fireEvent.click(screen.getByTestId('enhanced'));
++
++    expect(scrollToLine).not.toHaveBeenCalled();
++  });
++
++  it('无关的重渲染不会让恢复重新生效', () => {
++    useDocumentStore.getState().setPendingAnchor('某个标题');
++    const { rerender } = mount();
++    act(() => {
++      useDocumentStore.getState().setPendingAnchor(null);
++    });
++
++    act(() => rerender());
++
++    expect(scrollToLine).not.toHaveBeenCalled();
++  });
++});
+diff --git a/src/hooks/useReadingPosition.ts b/src/hooks/useReadingPosition.ts
+index d87084e..4c13abf 100644
+--- a/src/hooks/useReadingPosition.ts
++++ b/src/hooks/useReadingPosition.ts
+@@ -1,14 +1,15 @@
+ import { useCallback, useEffect, useRef } from 'react';
+ import type { EditorView } from '@codemirror/view';
+ import { scrollToLine } from '@/editor/MarkdownEditor';
+ import { useScrollContainer } from '@/components/layout/ScrollContainerContext';
++import { useDocumentStore } from '@/stores/document.store';
+ import { useSettingsStore } from '@/stores/settings.store';
+ import {
+   flushReadingPositions,
+   hydrateReadingPositions,
+   recallPosition,
+   rememberPosition,
+ } from '@/utils/reading-position';
+ import { heightInDocument, isWithinScrollTolerance, offsetWithinBlock } from '@/utils/scroll-math';
+ 
+ /** 保存位置的节流间隔 */
+@@ -65,40 +66,69 @@ export interface UseReadingPositionResult {
+  *   本 hook 拿到非空 `view` 时就已经具备正确的行高。
+  * - Shiki / Mermaid 的增强还会再一次显著改变高度，因此还需要
+  *   `onEnhanced` 在增强完成后校正一次，见下方 `onEnhanced` 的实现。
+  */
+ export function useReadingPosition({
+   documentId,
+   view,
+ }: UseReadingPositionParams): UseReadingPositionResult {
+   const container = useScrollContainer();
+   const shouldPersist = useSettingsStore((state) => state.settings.reading.restoreScrollPosition);
++  const pendingAnchor = useDocumentStore((state) => state.pendingAnchor);
+ 
+   /** 已经为哪个文档恢复过位置，避免同一文档在设置项等无关变化下被反复恢复 */
+   const restoredDocRef = useRef<string | null>(null);
+   /** 恢复时用来追加像素偏移的那个 rAF，卸载时要能取消 */
+   const offsetFrameRef = useRef(0);
+   /**
+    * 恢复之后，用户是否已经自己滚动过。
+    *
+    * 只要为真，`onEnhanced` 的校正就必须放弃——用户已经滚走了，增强完成后
+    * 把他拽回恢复点，比当初落错位置体验更差。放在 ref 里而不是 state，
+    * 是因为它只在事件回调里读写，不需要触发重渲染。
+    */
+   const userScrolledRef = useRef(false);
+   /**
+    * 我们自己最后一次程序化滚动落定后的 `scrollTop`，用来在 `scroll` 事件里
+    * 甄别「是不是我们自己写的」——见下面 `applyPosition` 与 scroll 监听器里
+    * 的用法，以及 `SCROLL_TOLERANCE_PX` 上方对取值考量的说明。
+    * null 表示这个文档还没发生过任何程序化滚动，此时不做任何判断。
+    */
+   const expectedScrollTopRef = useRef<number | null>(null);
++  /**
++   * 「带着锚点打开的」是哪一篇文档。
++   *
++   * 用户输入 `xxx.md#某标题` 时，意图是明确的：去那一节。恢复上次读到哪儿
++   * 必须整个让路——不只是首次恢复，`onEnhanced` 那次校正也一样，否则代码块
++   * 上色/图表出图结束后会把用户从锚点一把拽回上次的位置。
++   *
++   * 为什么要闩住而不是每次现读 `pendingAnchor`：那个字段是**消费一次即清空**
++   * 的，`usePendingAnchor` 滚完就把它置回 null 了，而增强要等好几百毫秒甚至
++   * 几秒才结束。等到 `onEnhanced` 触发时现读，读到的一定是 null，守卫等于
++   * 不存在。闩锁记的是「这篇文档是带锚点打开的」这个事实，它在整篇文档的
++   * 生命周期内都成立。
++   *
++   * 存 documentId 而不是布尔值，就不需要单独的复位逻辑：换文档之后这个值
++   * 自然对不上，上一篇的闩锁挡不住下一篇。
++   */
++  const anchorDocRef = useRef<string | null>(null);
++
++  /*
++   * 闩锁的置位。
++   *
++   * 声明在下面两条恢复路径**之前**，保证同一轮提交里先置位后判定。
++   * 判定处仍会额外看一眼当下的 `pendingAnchor`，覆盖「锚点刚设上、这个
++   * effect 还没跑过」的那一帧。
++   */
++  useEffect(() => {
++    if (pendingAnchor !== null && documentId !== '') anchorDocRef.current = documentId;
++  }, [pendingAnchor, documentId]);
+ 
+   // 首次挂载时把存储里的记录读进内存缓存
+   useEffect(() => {
+     void hydrateReadingPositions();
+   }, []);
+ 
+   // 滚动时记录位置
+   useEffect(() => {
+     if (!container || !view || documentId === '') return;
+ 
+@@ -213,45 +243,53 @@ export function useReadingPosition({
+       });
+     },
+     [],
+   );
+ 
+   // 文档就绪后恢复位置一次（受设置控制——这是「跨会话恢复」，可以关掉）
+   useEffect(() => {
+     if (!container || !view || documentId === '' || !shouldPersist) return;
+     // 只在这个文档还没恢复过时动手，避免设置项变化之类的重渲染把用户重新拽走
+     if (restoredDocRef.current === documentId) return;
++    // 带锚点打开的文档，锚点说了算，见 anchorDocRef
++    if (pendingAnchor !== null || anchorDocRef.current === documentId) return;
+ 
+     const position = recallPosition(documentId);
+     if (!position) return;
+     restoredDocRef.current = documentId;
+ 
+     applyPosition(view, container, position.line, position.offset);
+-  }, [container, view, documentId, shouldPersist, applyPosition]);
++  }, [container, view, documentId, shouldPersist, pendingAnchor, applyPosition]);
+ 
+   /**
+    * 增强完成后再校正一次滚动位置。
+    *
+    * 只在「这个文档已经恢复过」且「用户还没自己滚动过」时才出手，理由见
+-   * `userScrolledRef` 的注释。两个条件任一不满足都直接放弃，不做任何事——
++   * `userScrolledRef` 的注释。任一条件不满足都直接放弃，不做任何事——
+    * 尤其不能因为拿不到位置就退回顶部之类的兜底动作。
++   *
++   * 带锚点打开的文档要额外挡住：`userScrolledRef` 拦不住它——锚点跳转本身
++   * 就是程序化滚动，不会被判成用户操作，于是这一次校正会把用户从他明确
++   * 指定的锚点拽回上次读到的位置。这是本条守卫存在的**唯一**理由，删掉它
++   * 首次恢复看起来仍然正常，坏的是几秒之后。
+    */
+   const onEnhanced = useCallback((): void => {
+     if (!container || !view) return;
+     if (restoredDocRef.current !== documentId) return;
+     if (userScrolledRef.current) return;
++    if (pendingAnchor !== null || anchorDocRef.current === documentId) return;
+ 
+     const position = recallPosition(documentId);
+     if (!position) return;
+ 
+     applyPosition(view, container, position.line, position.offset);
+-  }, [container, view, documentId, applyPosition]);
++  }, [container, view, documentId, pendingAnchor, applyPosition]);
+ 
+   // 换文档时重置恢复状态相关的三个标记，允许在新文档上重新走一遍恢复
+   useEffect(() => {
+     restoredDocRef.current = null;
+     userScrolledRef.current = false;
+     expectedScrollTopRef.current = null;
+   }, [documentId]);
+ 
+   // 卸载时别留下悬挂的 rAF
+   useEffect(() => {
+diff --git a/src/hooks/useScrollSpy.ts b/src/hooks/useScrollSpy.ts
+index 86514cb..9d93071 100644
+--- a/src/hooks/useScrollSpy.ts
++++ b/src/hooks/useScrollSpy.ts
+@@ -1,30 +1,42 @@
+ import { useEffect, useMemo } from 'react';
+ import type { EditorView } from '@codemirror/view';
+ import { activeHeadingAt, flattenToc } from '@/markdown/toc';
+ import { useScrollContainer } from '@/components/layout/ScrollContainerContext';
+ import { useDocumentStore } from '@/stores/document.store';
+ import { useSettingsStore } from '@/stores/settings.store';
+-import { heightInDocument } from '@/utils/scroll-math';
++import { heightInDocument, isScrolledToBottom } from '@/utils/scroll-math';
+ 
+ /**
+  * 探测点相对容器顶边再往下挪的像素数。
+  *
+  * 不是「窄带」的变体，只是一道防四舍五入的余量：`scrollToLine` 把目标行的
+  * 顶部对齐到容器顶边，但浏览器会把 `scrollTop` 夹到整数/设备像素，落点
+  * 可能比行顶高上不到 1px——正好卡在「还算上一块」的一侧，于是点了「第 9 章」
+  * 高亮却停在第 8 章。往下挪 2px 就能吞掉这类误差，同时小到肉眼无法察觉
+  * （章节标题本身就有十几像素高）。取值理由与 `useReadingPosition` 里的
+  * `SCROLL_TOLERANCE_PX` 是同一类：只吞次像素抖动，不吞真实位移。
+  */
+ const SPY_PROBE_OFFSET_PX = 2;
+ 
++/**
++ * 判定「已经滚到底」时允许的误差（像素）。
++ *
++ * 取 2 而不是 1：`scrollTop` 在浏览器缩放、非整数设备像素比下是**带小数**
++ * 的，`scrollHeight - scrollTop - clientHeight` 因此几乎不会落在整数上。
++ * 1px 正卡在这类残差的边缘——判据一旦不成立，末尾章节就又变回「目录里点
++ * 不亮」，而且是静默复发，不会有任何报错提示。残差本身小于一个 CSS 像素，
++ * 2px 足够盖住；而它离「用户真的还没滚到底」的距离差着好几个数量级，
++ * 不会把没到底误判成到底。
++ */
++const BOTTOM_TOLERANCE_PX = 2;
++
+ /**
+  * 目录高亮（Scroll Spy）。
+  *
+  * 判据从「IntersectionObserver 观察标题元素」换成「视口顶行 vs 标题行号」。
+  * 换的原因不是性能，是旧做法**已经不成立**了：观察器要求标题元素真实存在
+  * 于 DOM 里，而编辑器只渲染视口附近的块——滚到文档中部时，上方所有标题的
+  * DOM 早已被销毁，观察器手里剩下的全是失效节点，于是高亮停在打开文档时的
+  * 第一个标题再也不动。行号比对完全不看 DOM，反而更准。
+  *
+  * 顺带消失的是旧实现里那条「顶部 25% 窄带」：窄带是为了压住
+@@ -59,29 +71,32 @@ export function useScrollSpy(view: EditorView | null): void {
+        * overflow 是 visible，编辑器随内容自然增高）。所以要先把容器可视区
+        * 顶部换算到 CodeMirror 的文档坐标系里，再问它这个高度落在哪一行。
+        * 直接读 `view.scrollDOM.scrollTop` 会永远得到 0。
+        */
+       /*
+        * 滚到底时换用视口**底边**做探测点。
+        *
+        * 文档末尾的标题永远推不到视口顶边——已经没有可滚的余量了。仍按顶边
+        * 判定的话，最后一节（有时是最后好几节）在目录里根本无法被高亮，点它
+        * 会高亮到上一节，而且怎么滚都回不来。到底意味着「最后一屏就是全部」，
+-       * 把这一屏里最后一个标题算作当前位置，既能让末尾章节可达，也符合
+-       * 「滚到底通常就是在看结尾」的直觉。
++       * 把这一屏里最后一个标题算作当前位置，让末尾章节至少可达。
+        *
+-       * `scrollTop > 0` 这一半不能省：整篇文档比视口还短时（根本不用滚），
+-       * 底边条件天然成立，少了它会变成「无论看哪儿都高亮最后一节」。
++       * 代价说清楚：最后一屏里若挤着好几个标题，不管在看哪一个，高亮都会
++       * 落在最靠后的那个。这是取舍，不是全面改善——自然滚到底时，原来那种
++       * 按顶边算出来的高亮其实是准确的。用可达性换掉了这份准确。
+        */
+-      const atBottom =
+-        container.scrollTop > 0 &&
+-        container.scrollHeight - container.scrollTop - container.clientHeight <= 1;
++      const atBottom = isScrolledToBottom(
++        container.scrollTop,
++        container.scrollHeight,
++        container.clientHeight,
++        BOTTOM_TOLERANCE_PX,
++      );
+ 
+       const heightInDoc = heightInDocument(
+         container.getBoundingClientRect().top +
+           (atBottom ? container.clientHeight : SPY_PROBE_OFFSET_PX),
+         view.documentTop,
+       );
+       const line = view.state.doc.lineAt(view.lineBlockAtHeight(heightInDoc).from).number - 1;
+ 
+       /*
+        * 视口顶部还在第一个标题之前（文档以正文开头）时退回第一个标题：
+diff --git a/src/utils/scroll-math.test.ts b/src/utils/scroll-math.test.ts
+index eb566c9..bc6a3d7 100644
+--- a/src/utils/scroll-math.test.ts
++++ b/src/utils/scroll-math.test.ts
+@@ -1,12 +1,12 @@
+ import { describe, expect, it } from 'vitest';
+-import { heightInDocument, isWithinScrollTolerance, offsetWithinBlock } from './scroll-math';
++import { heightInDocument, isScrolledToBottom, isWithinScrollTolerance, offsetWithinBlock } from './scroll-math';
+ 
+ describe('heightInDocument', () => {
+   it('容器顶部在文档顶部下方时，返回两者的差', () => {
+     expect(heightInDocument(500, 100)).toBe(400);
+   });
+ 
+   it('容器顶部与文档顶部重合时，返回 0', () => {
+     expect(heightInDocument(100, 100)).toBe(0);
+   });
+ 
+@@ -42,10 +42,52 @@ describe('isWithinScrollTolerance', () => {
+   it('差值超出容差一点时，判定为不在容差内', () => {
+     expect(isWithinScrollTolerance(102.5, 100, 2)).toBe(false);
+     expect(isWithinScrollTolerance(97.5, 100, 2)).toBe(false);
+   });
+ 
+   it('容差为 0 时，只有完全相等才算在容差内', () => {
+     expect(isWithinScrollTolerance(100, 100, 0)).toBe(true);
+     expect(isWithinScrollTolerance(100.1, 100, 0)).toBe(false);
+   });
+ });
++
++describe('isScrolledToBottom', () => {
++  /** 一篇远比视口长的文档：内容 5000px，视口 800px，最大可滚 4200px */
++  const LONG = { height: 5000, client: 800 };
++
++  it('停在文档顶部时不算到底', () => {
++    expect(isScrolledToBottom(0, LONG.height, LONG.client, 2)).toBe(false);
++  });
++
++  it('滚到中途时不算到底', () => {
++    expect(isScrolledToBottom(2000, LONG.height, LONG.client, 2)).toBe(false);
++  });
++
++  it('恰好滚到底时算到底', () => {
++    expect(isScrolledToBottom(4200, LONG.height, LONG.client, 2)).toBe(true);
++  });
++
++  it('差值落在容差内时算到底', () => {
++    // 浏览器缩放 / 非整数 DPR 下 scrollTop 带小数，永远差那么一点点
++    expect(isScrolledToBottom(4198.4, LONG.height, LONG.client, 2)).toBe(true);
++    expect(isScrolledToBottom(4198, LONG.height, LONG.client, 2)).toBe(true);
++  });
++
++  it('差值超出容差时不算到底', () => {
++    expect(isScrolledToBottom(4197.5, LONG.height, LONG.client, 2)).toBe(false);
++  });
++
++  it('内容一屏放得下时恒不算到底', () => {
++    /*
++     * 没有这条特判，`scrollHeight - scrollTop - clientHeight` 天然落在容差
++     * 内，「到底」会恒成立——短文档会变成「无论看哪儿都高亮最后一节」。
++     */
++    expect(isScrolledToBottom(0, 800, 800, 2)).toBe(false);
++    expect(isScrolledToBottom(0, 600, 800, 2)).toBe(false);
++  });
++
++  it('可滚余量本身就在容差之内时，同样按不可滚处理', () => {
++    // 只比视口高 1px：这一像素的余量没有任何阅读意义，不该触发到底规则
++    expect(isScrolledToBottom(0, 801, 800, 2)).toBe(false);
++    expect(isScrolledToBottom(1, 801, 800, 2)).toBe(false);
++  });
++});
+diff --git a/src/utils/scroll-math.ts b/src/utils/scroll-math.ts
+index d16403e..21c72f3 100644
+--- a/src/utils/scroll-math.ts
++++ b/src/utils/scroll-math.ts
+@@ -38,10 +38,40 @@ export function offsetWithinBlock(heightInDoc: number, blockTop: number): number
+  * 一次观测到的 `scrollTop` 能否归为「跟我们自己最后一次写入的值一致」。
+  *
+  * `useReadingPosition` 用它甄别一次 `scroll` 事件是不是用户真的动了手：
+  * 差值在容差内就认为还是程序化滚动本身的抖动（次像素取整、增强改高度
+  * 触发的 scroll anchoring），容差的取值考量见调用方 `SCROLL_TOLERANCE_PX`
+  * 上方的说明——这里只负责比较，不负责解释为什么选这个数。
+  */
+ export function isWithinScrollTolerance(actual: number, expected: number, tolerance: number): boolean {
+   return Math.abs(actual - expected) <= tolerance;
+ }
++
++/**
++ * 容器是否已经滚到底。
++ *
++ * 目录高亮用它切换判据：正常情况下「当前章节」是最后一个越过视口顶边的
++ * 标题，但文档末尾的标题永远推不到顶边——已经没有可滚的余量了。到底时
++ * 改用视口底边判定，末尾章节才可能被高亮到。
++ *
++ * 和 `heightInDocument` / `offsetWithinBlock` 一样抽成纯函数，是因为判据
++ * 内联在 effect 里就只能靠真实容器验证，而这三行跟 DOM 没有关系。
++ *
++ * 短文档（内容一屏放得下）直接判 false：此时 `scrollHeight - clientHeight`
++ * 本来就在容差之内，不特判的话「到底」会恒成立，变成「无论看哪儿都高亮
++ * 最后一节」。
++ *
++ * @param tolerance 允许的误差（像素）。**不能取 0**：浏览器缩放或非整数
++ *   设备像素比下，`scrollTop` 是带小数的，`scrollHeight - scrollTop -
++ *   clientHeight` 永远落不到精确值上，判据会永不成立——末尾章节点不亮的
++ *   毛病会悄悄复发，而且没有任何报错。取值考量见调用方的说明。
++ */
++export function isScrolledToBottom(
++  scrollTop: number,
++  scrollHeight: number,
++  clientHeight: number,
++  tolerance: number,
++): boolean {
++  // 根本没有可滚的余量，「到底」这个概念不成立
++  if (scrollHeight - clientHeight <= tolerance) return false;
++  return scrollHeight - scrollTop - clientHeight <= tolerance;
++}

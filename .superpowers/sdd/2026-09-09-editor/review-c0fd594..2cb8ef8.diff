@@ -1,0 +1,516 @@
+# Review package: c0fd594..HEAD
+
+## Commits
+2cb8ef8 feat: 编辑设置分组
+
+## Files changed
+ src/components/settings/SettingsPanel.tsx          |   2 +
+ src/components/settings/sections/EditorSection.tsx | 123 +++++++++++++++++++++
+ src/components/settings/settings-coverage.test.ts  |  13 +++
+ src/stores/settings.store.test.ts                  |  41 ++++++-
+ src/stores/settings.store.ts                       |  12 ++
+ src/types/settings.ts                              |  50 ++++++++-
+ 6 files changed, 237 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/src/components/settings/SettingsPanel.tsx b/src/components/settings/SettingsPanel.tsx
+index a1eb3f7..abb497f 100644
+--- a/src/components/settings/SettingsPanel.tsx
++++ b/src/components/settings/SettingsPanel.tsx
+@@ -1,22 +1,24 @@
+ import { AppearanceSection } from './sections/AppearanceSection';
+ import { MarkdownSection } from './sections/MarkdownSection';
+ import { ReadingSection } from './sections/ReadingSection';
++import { EditorSection } from './sections/EditorSection';
+ import { AdvancedSection } from './sections/AdvancedSection';
+ 
+ /**
+  * 设置表单主体。
+  *
+  * 刻意不包含任何容器（抽屉 / 页面）——同一份表单同时被阅读器里的抽屉
+  * 和独立设置页（options.html）复用，容器差异留给各自的宿主处理。
+  * 这样「改一个设置项」永远只需要动一个文件。
+  */
+ export function SettingsPanel(): React.JSX.Element {
+   return (
+     <div>
+       <AppearanceSection />
+       <MarkdownSection />
+       <ReadingSection />
++      <EditorSection />
+       <AdvancedSection />
+     </div>
+   );
+ }
+diff --git a/src/components/settings/sections/EditorSection.tsx b/src/components/settings/sections/EditorSection.tsx
+new file mode 100644
+index 0000000..083dd24
+--- /dev/null
++++ b/src/components/settings/sections/EditorSection.tsx
+@@ -0,0 +1,123 @@
++import { Section } from '../Section';
++import { Field, Select, Slider, Switch } from '@/components/ui/form';
++import { useSettingsStore } from '@/stores/settings.store';
++import { SETTINGS_BOUNDS, type EditorSettings } from '@/types';
++
++/** 布尔类编辑设置 */
++const TOGGLES: ReadonlyArray<{
++  key: keyof Pick<EditorSettings, 'autoSave' | 'showLineNumbers' | 'indentWithTabs'>;
++  label: string;
++  description?: string;
++}> = [
++  {
++    key: 'autoSave',
++    label: '自动保存',
++    description:
++      '停笔后自动写回原文件。写入的是你磁盘上的真实文件，没有回收站——关掉它可以改为只在按 ⌘S 时保存。',
++  },
++  { key: 'showLineNumbers', label: '编辑态显示行号' },
++  { key: 'indentWithTabs', label: '用 Tab 缩进', description: '关闭时用空格，宽度由下方「缩进宽度」决定' },
++];
++
++/** 默认打开模式选项 */
++const MODE_OPTIONS: ReadonlyArray<{ value: EditorSettings['defaultMode']; label: string }> = [
++  { value: 'read', label: '阅读' },
++  { value: 'edit', label: '编辑' },
++];
++
++/**
++ * 每个设置项在这里的曝光键，供覆盖测试比对。
++ *
++ * 三个开关的 key 直接复用 TOGGLES（单一数据源，改开关不会漏改这份清单）；
++ * 其余四项是各自独立渲染的 Select / Slider，只能手写补全。
++ */
++export const EDITOR_FIELD_KEYS: ReadonlyArray<keyof EditorSettings> = [
++  ...TOGGLES.map((toggle) => toggle.key),
++  'defaultMode',
++  'autoSaveDelay',
++  'tabSize',
++  'keepVersions',
++];
++
++/** 编辑设置：自动保存、初始模式、缩进 */
++export function EditorSection(): React.JSX.Element {
++  const editor = useSettingsStore((state) => state.settings.editor);
++  const setEditor = useSettingsStore((state) => state.setEditor);
++
++  return (
++    <Section title="编辑" group="editor">
++      {TOGGLES.map((toggle) => (
++        <Field key={toggle.key} label={toggle.label} description={toggle.description}>
++          {(id) => (
++            <Switch
++              id={id}
++              checked={editor[toggle.key]}
++              onChange={(checked) => setEditor({ [toggle.key]: checked })}
++            />
++          )}
++        </Field>
++      ))}
++
++      <Field
++        label="自动保存延迟"
++        description="停止输入后等待这么久再写盘"
++        layout="stacked"
++        disabledReason={editor.autoSave ? undefined : '已关闭自动保存'}
++      >
++        {(id) => (
++          <Slider
++            id={id}
++            value={editor.autoSaveDelay}
++            min={SETTINGS_BOUNDS.autoSaveDelay.min}
++            max={SETTINGS_BOUNDS.autoSaveDelay.max}
++            step={SETTINGS_BOUNDS.autoSaveDelay.step}
++            unit="ms"
++            disabled={!editor.autoSave}
++            onChange={(autoSaveDelay) => setEditor({ autoSaveDelay })}
++          />
++        )}
++      </Field>
++
++      <Field label="打开文档的初始模式" description="新打开一份文档时默认停在阅读还是编辑">
++        {(id) => (
++          <Select
++            id={id}
++            value={editor.defaultMode}
++            options={MODE_OPTIONS}
++            onChange={(defaultMode) => setEditor({ defaultMode })}
++          />
++        )}
++      </Field>
++
++      <Field label="缩进宽度" layout="stacked">
++        {(id) => (
++          <Slider
++            id={id}
++            value={editor.tabSize}
++            min={SETTINGS_BOUNDS.tabSize.min}
++            max={SETTINGS_BOUNDS.tabSize.max}
++            step={SETTINGS_BOUNDS.tabSize.step}
++            onChange={(tabSize) => setEditor({ tabSize })}
++          />
++        )}
++      </Field>
++
++      <Field
++        label="保留的历史版本数"
++        description="内存中保留多少份「保存前」的快照，是自动保存唯一的后悔药"
++        layout="stacked"
++      >
++        {(id) => (
++          <Slider
++            id={id}
++            value={editor.keepVersions}
++            min={SETTINGS_BOUNDS.keepVersions.min}
++            max={SETTINGS_BOUNDS.keepVersions.max}
++            step={SETTINGS_BOUNDS.keepVersions.step}
++            onChange={(keepVersions) => setEditor({ keepVersions })}
++          />
++        )}
++      </Field>
++    </Section>
++  );
++}
+diff --git a/src/components/settings/settings-coverage.test.ts b/src/components/settings/settings-coverage.test.ts
+index 5feb183..90fc86c 100644
+--- a/src/components/settings/settings-coverage.test.ts
++++ b/src/components/settings/settings-coverage.test.ts
+@@ -1,13 +1,14 @@
+ import { describe, expect, it } from 'vitest';
+ import { DEFAULT_SETTINGS } from '@/types';
+ import { MARKDOWN_TOGGLES } from './sections/MarkdownSection';
++import { EDITOR_FIELD_KEYS } from './sections/EditorSection';
+ 
+ /**
+  * 防漂移测试。
+  *
+  * 每新增一种 Markdown 渲染能力都要同时改三处：类型定义、默认值、设置开关。
+  * 前两处漏了会编译报错，第三处漏了只会「悄悄少一个开关」——用户永远
+  * 关不掉这个能力，而且没人会发现。这条测试就是补上那个缺失的编译期约束。
+  */
+ describe('设置页覆盖度', () => {
+   it('每个 Markdown 能力开关都在设置页里出现', () => {
+@@ -20,10 +21,22 @@ describe('设置页覆盖度', () => {
+     const keys = MARKDOWN_TOGGLES.map((toggle) => toggle.key);
+     expect(new Set(keys).size).toBe(keys.length);
+   });
+ 
+   it('每个开关都有可读的中文标签', () => {
+     for (const toggle of MARKDOWN_TOGGLES) {
+       expect(toggle.label.trim()).not.toBe('');
+     }
+   });
+ });
++
++describe('编辑设置页覆盖度', () => {
++  it('每个编辑设置项都在设置页里出现', () => {
++    const declared = Object.keys(DEFAULT_SETTINGS.editor).sort();
++    const exposed = EDITOR_FIELD_KEYS.map(String).sort();
++    expect(exposed).toEqual(declared);
++  });
++
++  it('编辑设置页没有重复的字段', () => {
++    expect(new Set(EDITOR_FIELD_KEYS).size).toBe(EDITOR_FIELD_KEYS.length);
++  });
++});
+diff --git a/src/stores/settings.store.test.ts b/src/stores/settings.store.test.ts
+index 4add726..fd0d899 100644
+--- a/src/stores/settings.store.test.ts
++++ b/src/stores/settings.store.test.ts
+@@ -1,13 +1,19 @@
+ import { beforeEach, describe, expect, it, vi } from 'vitest';
+ import { DEFAULT_SETTINGS } from '@/types';
+-import { createMemoryStorageDriver, setStorageDriver } from '@/utils/storage';
++import {
++  STORAGE_AREAS,
++  STORAGE_KEYS,
++  createMemoryStorageDriver,
++  setStorageDriver,
++  writeValue,
++} from '@/utils/storage';
+ import { useSettingsStore } from './settings.store';
+ 
+ describe('settings store', () => {
+   beforeEach(() => {
+     setStorageDriver(createMemoryStorageDriver());
+     useSettingsStore.setState({ settings: DEFAULT_SETTINGS, hydrated: false });
+   });
+ 
+   it('存储为空时回落到默认设置', async () => {
+     await useSettingsStore.getState().hydrate();
+@@ -64,20 +70,53 @@ describe('settings store', () => {
+     const { appearance } = useSettingsStore.getState().settings;
+     expect(appearance.readingTheme).toBe('sepia');
+     expect(appearance.codeTheme).toBe('one-light');
+   });
+ 
+   it('未知主题 id 回落到默认主题', () => {
+     useSettingsStore.getState().setReadingTheme('不存在的主题');
+     expect(useSettingsStore.getState().settings.appearance.readingTheme).toBe('github');
+   });
+ 
++  it('从 schemaVersion 1 的旧结构升级：editor 分组补上默认值，其余分组的自定义值原样保留', async () => {
++    // 这是 R28 的实测：SETTINGS_SCHEMA_VERSION 从 1 升到 2 时新增了 editor 分组，
++    // 计划里写的是「不写迁移脚本，靠 hydrate 里的 deep-merge 兜底」。
++    // 本项目已经在 ReadingPosition 改结构时吃过一次同类亏——升级后旧数据被直接断言
++    // 成新类型，缺失字段变成 undefined 一路传导到渲染层，最终白屏。
++    // 所以这里不能只读代码就相信"deep-merge 会兜住"，必须绕开 store 的现有类型定义，
++    // 手写一份 schemaVersion:1 时代、真正没有 editor 字段的存量数据直接写入存储，
++    // 再走 hydrate 这条真实读取路径，实测升级后的行为。
++    const legacySynced = {
++      schemaVersion: 1,
++      appearance: { ...DEFAULT_SETTINGS.appearance, fontSize: 20 }, // 用户改过的旧字段
++      markdown: DEFAULT_SETTINGS.markdown,
++      reading: { ...DEFAULT_SETTINGS.reading, scrollSync: false }, // 用户改过的旧字段
++      // 故意不写 editor：schemaVersion 1 时这个分组还不存在
++    };
++    const legacyAdvanced = { ...DEFAULT_SETTINGS.advanced, customCss: 'body{color:red}' };
++
++    await writeValue(STORAGE_AREAS.settings, STORAGE_KEYS.settings, legacySynced);
++    await writeValue(STORAGE_AREAS.advanced, STORAGE_KEYS.advanced, legacyAdvanced);
++
++    await useSettingsStore.getState().hydrate();
++    const { settings } = useSettingsStore.getState();
++
++    // 确认 1：editor 分组存在且是默认值（旧数据里压根没有这个 key）
++    expect(settings.editor).toEqual(DEFAULT_SETTINGS.editor);
++    // 确认 2：其余分组没有被 deep-merge 误伤——用户在旧结构里改过的值原样保留
++    expect(settings.appearance.fontSize).toBe(20);
++    expect(settings.reading.scrollSync).toBe(false);
++    expect(settings.advanced.customCss).toBe('body{color:red}');
++    // 确认 3：结构版本号以代码为准前进到 2，不会卡在旧值上
++    expect(settings.schemaVersion).toBe(2);
++  });
++
+   it('resetGroup 只重置指定分组', () => {
+     useSettingsStore.getState().setAppearance({ fontSize: 22 });
+     useSettingsStore.getState().setReading({ scrollSync: false });
+     useSettingsStore.getState().resetGroup('appearance');
+ 
+     const { settings } = useSettingsStore.getState();
+     expect(settings.appearance.fontSize).toBe(DEFAULT_SETTINGS.appearance.fontSize);
+     expect(settings.reading.scrollSync).toBe(false);
+   });
+ });
+diff --git a/src/stores/settings.store.ts b/src/stores/settings.store.ts
+index 0bda37a..598906a 100644
+--- a/src/stores/settings.store.ts
++++ b/src/stores/settings.store.ts
+@@ -1,16 +1,17 @@
+ import { create } from 'zustand';
+ import {
+   DEFAULT_SETTINGS,
+   SETTINGS_SCHEMA_VERSION,
+   type AdvancedSettings,
+   type AppearanceSettings,
++  type EditorSettings,
+   type MarkdownSettings,
+   type ReadingSettings,
+   type Settings,
+ } from '@/types';
+ import { resolveReadingTheme } from '@/themes';
+ import { debounce, deepMerge } from '@/utils/fn';
+ import { createLogger } from '@/utils/logger';
+ import {
+   STORAGE_AREAS,
+   STORAGE_KEYS,
+@@ -38,36 +39,38 @@ export interface SettingsStore {
+    *
+    * 单独开一个 action 而不是让调用方连写三次 `setAppearance`：
+    * 「预设」的语义就是一次应用一整套搭配。代码配色与阅读主题脱节时，
+    * 代码块会像贴在页面上的一块补丁，比不换主题还难看。
+    * 换完之后用户仍可单独调整代码配色，不会被锁死。
+    */
+   setReadingTheme: (themeId: string) => void;
+   setMarkdown: (patch: Partial<MarkdownSettings>) => void;
+   setReading: (patch: Partial<ReadingSettings>) => void;
+   setAdvanced: (patch: Partial<AdvancedSettings>) => void;
++  setEditor: (patch: Partial<EditorSettings>) => void;
+   /** 重置某个分组到默认值 */
+   resetGroup: (group: keyof Omit<Settings, 'schemaVersion'>) => void;
+   /** 全部恢复默认 */
+   resetAll: () => void;
+ }
+ 
+ /** 防止「存储变更 -> 更新 store -> 又写回存储」的回环 */
+ let applyingRemoteChange = false;
+ 
+ /** 把 sync 分组写盘（防抖，避免拖动滑块时打爆配额） */
+ const persistSynced = debounce((settings: Settings) => {
+   const payload: SyncedSettings = {
+     schemaVersion: settings.schemaVersion,
+     appearance: settings.appearance,
+     markdown: settings.markdown,
+     reading: settings.reading,
++    editor: settings.editor,
+   };
+   void writeValue(STORAGE_AREAS.settings, STORAGE_KEYS.settings, payload);
+ }, 300);
+ 
+ /** 把 advanced 分组写盘（自定义 CSS/JS 体积大，单独放 local） */
+ const persistAdvanced = debounce((advanced: AdvancedSettings) => {
+   void writeValue(STORAGE_AREAS.advanced, STORAGE_KEYS.advanced, advanced);
+ }, 300);
+ 
+ /** 根据本次变更涉及的分组决定写哪个存储区 */
+@@ -146,20 +149,29 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
+ 
+   setAdvanced: (patch) => {
+     const next: Settings = {
+       ...get().settings,
+       advanced: { ...get().settings.advanced, ...patch },
+     };
+     set({ settings: next });
+     persist(next, true);
+   },
+ 
++  setEditor: (patch) => {
++    const next: Settings = {
++      ...get().settings,
++      editor: { ...get().settings.editor, ...patch },
++    };
++    set({ settings: next });
++    persist(next, false);
++  },
++
+   resetGroup: (group) => {
+     const next: Settings = { ...get().settings, [group]: DEFAULT_SETTINGS[group] };
+     set({ settings: next });
+     persist(next, group === 'advanced');
+   },
+ 
+   resetAll: () => {
+     set({ settings: DEFAULT_SETTINGS });
+     persistSynced(DEFAULT_SETTINGS);
+     persistAdvanced(DEFAULT_SETTINGS.advanced);
+diff --git a/src/types/settings.ts b/src/types/settings.ts
+index 76ce7e5..1ab2ce1 100644
+--- a/src/types/settings.ts
++++ b/src/types/settings.ts
+@@ -1,17 +1,17 @@
+ /**
+  * 用户设置的类型定义与默认值。
+  *
+  * 约定：
+  * - 所有设置项都必须有默认值，读取时以 `DEFAULT_SETTINGS` 做深度兜底，
+  *   这样新增字段不会让老用户的存量配置报错。
+- * - 设置对象是扁平分组（appearance / markdown / reading / advanced），
++ * - 设置对象是扁平分组（appearance / markdown / reading / advanced / editor），
+  *   与设置面板的分组一一对应，便于按组重置。
+  */
+ 
+ /** 主题模式 */
+ export type ThemeMode = 'light' | 'dark' | 'auto';
+ 
+ /** 正文可选字体族 */
+ export type FontFamilyKey =
+   | 'system'
+   | 'pingfang'
+@@ -111,32 +111,64 @@ export interface AdvancedSettings {
+   /** 实验特性总开关 */
+   experimental: boolean;
+   /**
+    * 在浏览器直接打开 .md 时，是否用阅读器接管该页面。
+    *
+    * 关闭后仍保留浏览器原本的纯文本显示——有人就是想看源码。
+    */
+   takeoverMarkdownPages: boolean;
+ }
+ 
++/** 编辑设置 */
++export interface EditorSettings {
++  /** 停笔后自动写回文件 */
++  autoSave: boolean;
++  /** 自动保存的防抖间隔（毫秒） */
++  autoSaveDelay: number;
++  /** 打开文档时的初始模式 */
++  defaultMode: 'read' | 'edit';
++  /** 编辑态显示行号 */
++  showLineNumbers: boolean;
++  /** 缩进宽度 */
++  tabSize: number;
++  /** 用 Tab 而不是空格缩进 */
++  indentWithTabs: boolean;
++  /**
++   * 内存里保留多少个「保存前的版本」。
++   *
++   * 自动保存写的是用户真实的本地文件，没有回收站。这个缓冲是唯一的后悔药，
++   * 因此不提供「0」这个选项。
++   */
++  keepVersions: number;
++}
++
+ /** 完整设置 */
+ export interface Settings {
+   appearance: AppearanceSettings;
+   markdown: MarkdownSettings;
+   reading: ReadingSettings;
+   advanced: AdvancedSettings;
++  editor: EditorSettings;
+   /** 配置结构版本，用于未来的迁移 */
+   schemaVersion: number;
+ }
+ 
+-/** 当前设置结构版本 */
+-export const SETTINGS_SCHEMA_VERSION = 1;
++/**
++ * 当前设置结构版本。
++ *
++ * 从 1 升到 2（新增 `editor` 分组）不配套迁移脚本：`settings.store` 的
++ * `hydrate` 用 `deepMerge(DEFAULT_SETTINGS, 存量数据)` 兜底，旧版本缺失的
++ * 分组会自动补上默认值，这正是当初定下这条 deep-merge 约定的目的。
++ * 已用 schemaVersion:1 的旧结构存量数据实测验证（见 settings.store.test.ts），
++ * 而不是仅凭这段注释的推断——本项目已经因为「断言旧数据是新结构」白屏过一次。
++ */
++export const SETTINGS_SCHEMA_VERSION = 2;
+ 
+ /** 默认设置 —— 单一事实来源 */
+ export const DEFAULT_SETTINGS: Settings = {
+   schemaVersion: SETTINGS_SCHEMA_VERSION,
+   appearance: {
+     theme: 'auto',
+     readingTheme: 'github',
+     fontFamily: 'system',
+     fontSize: 16,
+     lineHeight: 1.7,
+@@ -169,28 +201,40 @@ export const DEFAULT_SETTINGS: Settings = {
+     codeCollapseLong: false,
+     showProgressBar: true,
+   },
+   advanced: {
+     customCss: '',
+     customJs: '',
+     enableCustomJs: false,
+     experimental: false,
+     takeoverMarkdownPages: true,
+   },
++  editor: {
++    autoSave: true,
++    autoSaveDelay: 800,
++    defaultMode: 'read',
++    showLineNumbers: false,
++    tabSize: 2,
++    indentWithTabs: false,
++    keepVersions: 5,
++  },
+ };
+ 
+ /** 各设置项的取值边界，供 UI 与校验共用 */
+ export const SETTINGS_BOUNDS = {
+   fontSize: { min: 12, max: 24, step: 1 },
+   lineHeight: { min: 1.2, max: 2.4, step: 0.1 },
+   letterSpacing: { min: 0, max: 2, step: 0.1 },
+   autoRefreshInterval: { min: 500, max: 5000, step: 100 },
++  autoSaveDelay: { min: 300, max: 5000, step: 100 },
++  tabSize: { min: 2, max: 8, step: 1 },
++  keepVersions: { min: 1, max: 20, step: 1 },
+ } as const;
+ 
+ /** 可选代码块主题（Shiki 内置主题的常用子集，成对出现） */
+ export const CODE_THEME_OPTIONS: ReadonlyArray<{ label: string; light: string; dark: string }> = [
+   { label: 'GitHub', light: 'github-light', dark: 'github-dark' },
+   { label: 'One', light: 'one-light', dark: 'one-dark-pro' },
+   { label: 'Vitesse', light: 'vitesse-light', dark: 'vitesse-dark' },
+   { label: 'Material', light: 'material-theme-lighter', dark: 'material-theme-darker' },
+ ];
+ 

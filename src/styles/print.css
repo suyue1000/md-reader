@@ -6,10 +6,34 @@
  * 外壳改为块级、高度自适应、滚动容器不再裁剪内容。
  */
 
+/*
+ * 打印用的完整正文容器（`export/index.ts` 的 `PRINT_ROOT_ID`）。
+ *
+ * 它平时必须不可见，只在打印时出现。这条规则**必须写在下面的
+ * `@media print` 之前**：媒体查询不增加特异性，两条规则都是 (1,0,0)，
+ * 谁在后面谁赢。顺序写反了的话打印时它照样是 display:none，
+ * 纸上只剩一片空白——而屏幕上一切正常，不会有任何报错。
+ */
+#print-root {
+  display: none;
+}
+
 @media print {
   /* 工具栏、侧栏、状态栏、进度条、返回顶部等界面元素一律不打印 */
   .no-print {
     display: none !important;
+  }
+
+  /*
+   * 编辑器只渲染视口附近的块，直接打印它得到的是残缺文档（而且看起来像完整的）。
+   * 打印时把它整个藏掉，纸上只留 #print-root 里那份离屏渲染出来的完整正文。
+   */
+  .cm-editor {
+    display: none !important;
+  }
+
+  #print-root {
+    display: block;
   }
 
   html,

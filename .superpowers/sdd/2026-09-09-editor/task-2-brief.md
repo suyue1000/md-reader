@@ -1,0 +1,196 @@
+### Task 2: 顶层块切分（纯函数）
+
+把 markdown-it 的 token 流切成「顶层块 + 行区间」。这是整个实时预览的地基，也是最容易出错的一步，因此单独成 Task 并重点覆盖测试。
+
+**Files:**
+- Create: `src/editor/block-slice.ts`
+- Test: `src/editor/block-slice.test.ts`
+
+**Interfaces:**
+- Consumes: `markdown-it` 的 `Token` 类型
+- Produces:
+
+```ts
+export interface BlockSlice {
+  startLine: number;   // 0-based，含
+  endLine: number;     // 0-based，不含
+  tokens: Token[];
+  trailing: boolean;   // true 表示无源码行区间，挂在文末
+}
+export function sliceTopLevelBlocks(tokens: readonly Token[]): BlockSlice[];
+```
+
+- [ ] **Step 1: 写失败的测试**
+
+创建 `src/editor/block-slice.test.ts`：
+
+```ts
+import MarkdownIt from 'markdown-it';
+import footnote from 'markdown-it-footnote';
+import { describe, expect, it } from 'vitest';
+import { sliceTopLevelBlocks, type BlockSlice } from './block-slice';
+
+/** 用最朴素的 markdown-it 实例产出 token，避免测试依赖插件配置 */
+function slice(source: string, md = new MarkdownIt()): BlockSlice[] {
+  return sliceTopLevelBlocks(md.parse(source, {}));
+}
+
+describe('sliceTopLevelBlocks', () => {
+  it('把标题与段落切成两块，行区间不重叠', () => {
+    const blocks = slice('# 标题\n\n正文');
+    expect(blocks.map((b) => [b.startLine, b.endLine])).toEqual([
+      [0, 1],
+      [2, 3],
+    ]);
+  });
+
+  it('围栏代码块整体是一块，内部的空行不构成切点', () => {
+    const blocks = slice('```js\nconst a = 1;\n\nconst b = 2;\n```');
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]?.startLine).toBe(0);
+    expect(blocks[0]?.endLine).toBe(5);
+  });
+
+  it('嵌套列表是一块，不会被拆成每项一块', () => {
+    const blocks = slice('- 甲\n  - 乙\n- 丙');
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]?.endLine).toBe(3);
+  });
+
+  it('表格是一块', () => {
+    const blocks = slice('| a | b |\n| - | - |\n| 1 | 2 |');
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]?.endLine).toBe(3);
+  });
+
+  it('引用块整体是一块', () => {
+    const blocks = slice('> 甲\n> 乙');
+    expect(blocks).toHaveLength(1);
+  });
+
+  it('分隔线这类自闭合 token 也能成块', () => {
+    const blocks = slice('段落\n\n---\n\n段落');
+    expect(blocks).toHaveLength(3);
+    expect(blocks[1]?.startLine).toBe(2);
+  });
+
+  it('setext 标题的行区间覆盖两行', () => {
+    const blocks = slice('标题\n===\n');
+    expect(blocks[0]?.endLine).toBe(2);
+  });
+
+  it('脚注汇总块没有源码行区间，标记为 trailing', () => {
+    const md = new MarkdownIt().use(footnote);
+    const blocks = slice('正文[^1]\n\n[^1]: 注释', md);
+    const trailing = blocks.filter((b) => b.trailing);
+    expect(trailing).toHaveLength(1);
+    // trailing 块不占源码行，因此起止相同
+    expect(trailing[0]?.startLine).toBe(trailing[0]?.endLine);
+  });
+
+  it('空文档产出空数组', () => {
+    expect(slice('')).toEqual([]);
+  });
+});
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `npx vitest run src/editor/block-slice.test.ts`
+Expected: FAIL，`Failed to resolve import "./block-slice"`
+
+- [ ] **Step 3: 实现**
+
+创建 `src/editor/block-slice.ts`：
+
+```ts
+import type Token from 'markdown-it/lib/token.mjs';
+
+/**
+ * 一个顶层块。
+ *
+ * 「顶层」指 `token.level === 0` 的那一层：一个段落、一个标题、一整个列表、
+ * 一整张表格。切到更细的粒度（比如每个列表项）会让编辑列表时只有一项变源码，
+ * 而列表的语法恰恰是跨项的（缩进、编号连续性），那样反而更难改。
+ */
+export interface BlockSlice {
+  /** 0-based 起始行，含 */
+  startLine: number;
+  /** 0-based 结束行，不含 */
+  endLine: number;
+  /** 本块的 token 切片，交给 markdown-it 的 renderer 渲染 */
+  tokens: Token[];
+  /**
+   * 是否没有对应的源码行区间。
+   *
+   * markdown-it-footnote 会把散落各处的 `[^1]: 注释` 收拢成一个汇总块，
+   * 挂在 token 流末尾且 `map === null`。它在页面上要出现（否则屏幕与导出
+   * 不一致），但没有能被替换的源码行，只能作为文末 widget 附加。
+   */
+  trailing: boolean;
+}
+
+/**
+ * 把 token 流切成顶层块。
+ *
+ * 用「深度归零」而不是「找同名的 close token」来定位块的结束：容器类插件
+ * （markdown-it-container）会产出自定义的开合标签名，按名字配对需要维护
+ * 一张表，而深度计数对任何成对 token 都成立。
+ */
+export function sliceTopLevelBlocks(tokens: readonly Token[]): BlockSlice[] {
+  const blocks: BlockSlice[] = [];
+  /** 已消费到的最大行号，作为 trailing 块的挂载点 */
+  let maxLine = 0;
+
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token === undefined || token.level !== 0) continue;
+
+    // 找出本块覆盖的 token 范围：自闭合就是它自己，成对则数到深度归零
+    let end = i;
+    if (token.nesting === 1) {
+      let depth = 0;
+      for (let j = i; j < tokens.length; j++) {
+        const current = tokens[j];
+        if (current === undefined) continue;
+        depth += current.nesting;
+        if (depth === 0) {
+          end = j;
+          break;
+        }
+      }
+    } else if (token.nesting === -1) {
+      // 没有配对开标签的孤立闭标签，跳过而不是让它自成一块
+      continue;
+    }
+
+    const slice = tokens.slice(i, end + 1);
+    if (token.map) {
+      const [startLine, endLine] = token.map;
+      maxLine = Math.max(maxLine, endLine);
+      blocks.push({ startLine, endLine, tokens: slice, trailing: false });
+    } else {
+      blocks.push({ startLine: maxLine, endLine: maxLine, tokens: slice, trailing: true });
+    }
+
+    i = end;
+  }
+
+  return blocks;
+}
+```
+
+- [ ] **Step 4: 运行测试确认通过**
+
+Run: `npx vitest run src/editor/block-slice.test.ts`
+Expected: PASS（9 个用例）
+
+- [ ] **Step 5: 提交**
+
+```bash
+git add src/editor/block-slice.ts src/editor/block-slice.test.ts
+git commit -m "feat: 顶层块切分"
+```
+
+---
+

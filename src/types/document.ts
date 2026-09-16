@@ -61,6 +61,15 @@ export interface TocNode {
   text: string;
   /** 标题级别 1~6 */
   level: number;
+  /**
+   * 标题所在的 0-based 行号，目录跳转与滚动同步据此定位。
+   *
+   * 记行号而不是继续依赖锚点 id 去 DOM 里查元素：编辑器只渲染视口附近的块，
+   * 视口外的标题根本不在 DOM 里——查不到就跳不了，也看不出「现在在哪一节」。
+   * 行号是文档模型自带的坐标，不受渲染与否影响，和 `ReadingPosition.line`
+   * 是同一套坐标系。
+   */
+  line: number;
   children: TocNode[];
 }
 
@@ -83,19 +92,17 @@ export type WatchStatus =
 /**
  * 单个文档的阅读状态。
  *
- * 同时记录锚点与比例，是因为两者各有失效场景：
- * - 纯比例在文档长度变化后会偏移（自动刷新最常见的就是文末追加内容）；
- * - 纯锚点丢失了章节内部的位置，且文档无标题时完全不可用。
- * 优先用「锚点 + 相对锚点的像素偏移」，锚点找不到时回落到比例。
+ * 记录行号而不是锚点 + 比例：编辑器的文档模型本身就是按行寻址的，行号
+ * 是天然稳定的坐标。旧方案要靠「锚点 + 像素偏移 + 比例」三重兜底，是因为
+ * 渲染后的 DOM 没有一个稳定的坐标系——标题会被改、高度会随字号变。
+ * 行号没有这些问题：改了第 100 行之后的内容，第 50 行还是第 50 行。
  */
 export interface ReadingPosition {
   documentId: string;
-  /** 滚动百分比 0~1，锚点失效时的兜底 */
-  ratio: number;
-  /** 视口顶部上方最近的标题锚点 */
-  anchorId: string | null;
-  /** 滚动位置相对该锚点顶部的像素偏移 */
-  anchorOffset: number;
+  /** 0-based 行号 */
+  line: number;
+  /** 该行在视口中的像素偏移，用于长行的精确还原 */
+  offset: number;
   updatedAt: number;
 }
 

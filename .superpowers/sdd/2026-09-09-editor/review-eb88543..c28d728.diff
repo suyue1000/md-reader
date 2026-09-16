@@ -1,0 +1,92 @@
+# Review package: eb88543..HEAD
+
+## Commits
+c28d728 fix: 补充注释和嵌套容器测试用例
+
+## Files changed
+ src/editor/block-slice.test.ts | 7 +++++++
+ src/editor/block-slice.ts      | 9 ++++++++-
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/src/editor/block-slice.test.ts b/src/editor/block-slice.test.ts
+index d5e41e2..ab9d267 100644
+--- a/src/editor/block-slice.test.ts
++++ b/src/editor/block-slice.test.ts
+@@ -54,14 +54,21 @@ describe('sliceTopLevelBlocks', () => {
+ 
+   it('脚注汇总块没有源码行区间，标记为 trailing', () => {
+     const md = new MarkdownIt().use(footnote);
+     const blocks = slice('正文[^1]\n\n[^1]: 注释', md);
+     const trailing = blocks.filter((b) => b.trailing);
+     expect(trailing).toHaveLength(1);
+     // trailing 块不占源码行，因此起止相同
+     expect(trailing[0]?.startLine).toBe(trailing[0]?.endLine);
+   });
+ 
++  it('引用块里套列表、列表里再套列表，整体仍是一块', () => {
++    const blocks = slice('> - 甲\n>   - 乙\n>   - 丙\n> - 丁');
++    expect(blocks).toHaveLength(1);
++    expect(blocks[0]?.startLine).toBe(0);
++    expect(blocks[0]?.endLine).toBe(4);
++  });
++
+   it('空文档产出空数组', () => {
+     expect(slice('')).toEqual([]);
+   });
+ });
+diff --git a/src/editor/block-slice.ts b/src/editor/block-slice.ts
+index 9d33caa..bf6a1e9 100644
+--- a/src/editor/block-slice.ts
++++ b/src/editor/block-slice.ts
+@@ -13,20 +13,25 @@ export interface BlockSlice {
+   /** 0-based 结束行，不含 */
+   endLine: number;
+   /** 本块的 token 切片，交给 markdown-it 的 renderer 渲染 */
+   tokens: Token[];
+   /**
+    * 是否没有对应的源码行区间。
+    *
+    * markdown-it-footnote 会把散落各处的 `[^1]: 注释` 收拢成一个汇总块，
+    * 挂在 token 流末尾且 `map === null`。它在页面上要出现（否则屏幕与导出
+    * 不一致），但没有能被替换的源码行，只能作为文末 widget 附加。
++   *
++   * 注意：多个 trailing 块会拿到**相同**的 `[maxLine, maxLine]` 区间——
++   * 它们本来就没有源码位置，无从区分。因此下游绝不能用行区间来标识
++   * trailing 块（比如拿它当缓存键），必须另找唯一标识。
++   * 当前只有 footnote 会产出这种块，且每篇文档至多一个，尚不会触发。
+    */
+   trailing: boolean;
+ }
+ 
+ /**
+  * 把 token 流切成顶层块。
+  *
+  * 用「深度归零」而不是「找同名的 close token」来定位块的结束：容器类插件
+  * （markdown-it-container）会产出自定义的开合标签名，按名字配对需要维护
+  * 一张表，而深度计数对任何成对 token 都成立。
+@@ -47,21 +52,23 @@ export function sliceTopLevelBlocks(tokens: readonly Token[]): BlockSlice[] {
+       for (let j = i; j < tokens.length; j++) {
+         const current = tokens[j];
+         if (current === undefined) continue;
+         depth += current.nesting;
+         if (depth === 0) {
+           end = j;
+           break;
+         }
+       }
+     } else if (token.nesting === -1) {
+-      // 没有配对开标签的孤立闭标签，跳过而不是让它自成一块
++      // 良构的 token 流走不到这里——配对的开标签一定先被处理，
++      // 它的闭标签会被 `i = end` 跳过。留着是防自定义插件产出不平衡的
++      // nesting，那种情况下宁可漏掉一个孤立闭标签，也不该让它自成一块
+       continue;
+     }
+ 
+     const slice = tokens.slice(i, end + 1);
+     if (token.map) {
+       const [startLine, endLine] = token.map;
+       maxLine = Math.max(maxLine, endLine);
+       blocks.push({ startLine, endLine, tokens: slice, trailing: false });
+     } else {
+       blocks.push({ startLine: maxLine, endLine: maxLine, tokens: slice, trailing: true });

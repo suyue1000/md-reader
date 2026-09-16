@@ -4,10 +4,10 @@ import { buildTocTree, filterToc, flattenToc } from './toc';
 describe('buildTocTree', () => {
   it('按层级嵌套标题', () => {
     const tree = buildTocTree([
-      { id: 'a', text: 'A', level: 1 },
-      { id: 'a1', text: 'A1', level: 2 },
-      { id: 'a2', text: 'A2', level: 2 },
-      { id: 'b', text: 'B', level: 1 },
+      { id: 'a', text: 'A', level: 1, line: 0 },
+      { id: 'a1', text: 'A1', level: 2, line: 10 },
+      { id: 'a2', text: 'A2', level: 2, line: 20 },
+      { id: 'b', text: 'B', level: 1, line: 30 },
     ]);
 
     expect(tree).toHaveLength(2);
@@ -17,8 +17,8 @@ describe('buildTocTree', () => {
 
   it('处理跳级（h1 直接到 h3）', () => {
     const tree = buildTocTree([
-      { id: 'a', text: 'A', level: 1 },
-      { id: 'c', text: 'C', level: 3 },
+      { id: 'a', text: 'A', level: 1, line: 0 },
+      { id: 'c', text: 'C', level: 3, line: 10 },
     ]);
 
     expect(tree).toHaveLength(1);
@@ -27,9 +27,9 @@ describe('buildTocTree', () => {
 
   it('处理层级回退', () => {
     const tree = buildTocTree([
-      { id: 'a', text: 'A', level: 1 },
-      { id: 'a1', text: 'A1', level: 3 },
-      { id: 'a2', text: 'A2', level: 2 },
+      { id: 'a', text: 'A', level: 1, line: 0 },
+      { id: 'a1', text: 'A1', level: 3, line: 10 },
+      { id: 'a2', text: 'A2', level: 2, line: 20 },
     ]);
 
     // A1 与 A2 都应挂在 A 下，A2 不能变成 A1 的子节点
@@ -37,7 +37,7 @@ describe('buildTocTree', () => {
   });
 
   it('文档以深层标题开头时不丢节点', () => {
-    const tree = buildTocTree([{ id: 'c', text: 'C', level: 3 }]);
+    const tree = buildTocTree([{ id: 'c', text: 'C', level: 3, line: 0 }]);
     expect(tree.map((n) => n.id)).toEqual(['c']);
   });
 });
@@ -45,11 +45,11 @@ describe('buildTocTree', () => {
 describe('filterToc', () => {
   /** 三层测试树：性能报告 > (实测对照, 关键点) / 优化路线 */
   const tree = buildTocTree([
-    { id: 'perf', text: '性能报告', level: 1 },
-    { id: 'measure', text: '实测对照', level: 2 },
-    { id: 'device', text: '真机数据', level: 3 },
-    { id: 'keypoint', text: '关键点', level: 2 },
-    { id: 'roadmap', text: '优化路线', level: 1 },
+    { id: 'perf', text: '性能报告', level: 1, line: 0 },
+    { id: 'measure', text: '实测对照', level: 2, line: 10 },
+    { id: 'device', text: '真机数据', level: 3, line: 20 },
+    { id: 'keypoint', text: '关键点', level: 2, line: 30 },
+    { id: 'roadmap', text: '优化路线', level: 1, line: 40 },
   ]);
 
   it('空关键词返回完整目录', () => {
@@ -82,7 +82,7 @@ describe('filterToc', () => {
   });
 
   it('忽略大小写', () => {
-    const english = buildTocTree([{ id: 'a', text: 'Performance Report', level: 1 }]);
+    const english = buildTocTree([{ id: 'a', text: 'Performance Report', level: 1, line: 0 }]);
     expect(filterToc(english, 'performance')).toHaveLength(1);
   });
 
@@ -104,6 +104,7 @@ describe('目录生成性能', () => {
       id: `h-${String(i)}`,
       text: `标题 ${String(i)}`,
       level: (i % 5) + 1,
+      line: i,
     }));
 
     const start = performance.now();
@@ -118,9 +119,9 @@ describe('目录生成性能', () => {
 describe('flattenToc', () => {
   it('按文档顺序展平', () => {
     const tree = buildTocTree([
-      { id: 'a', text: 'A', level: 1 },
-      { id: 'a1', text: 'A1', level: 2 },
-      { id: 'b', text: 'B', level: 1 },
+      { id: 'a', text: 'A', level: 1, line: 0 },
+      { id: 'a1', text: 'A1', level: 2, line: 10 },
+      { id: 'b', text: 'B', level: 1, line: 20 },
     ]);
 
     expect(flattenToc(tree).map((n) => n.id)).toEqual(['a', 'a1', 'b']);

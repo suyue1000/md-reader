@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ListTree, Search, X } from 'lucide-react';
 import { TocItem } from './TocItem';
+import { useEditorView } from '@/editor/EditorContext';
+import { scrollToLine } from '@/editor/MarkdownEditor';
+import { syncAnchorHash } from '@/hooks/useEmbeddedDocument';
 import { filterToc, flattenToc } from '@/markdown/toc';
-import { useScrollContainer } from '@/components/layout/ScrollContainerContext';
 import { useDocumentStore } from '@/stores/document.store';
 import { useSettingsStore } from '@/stores/settings.store';
 
@@ -22,10 +24,11 @@ function Hint({ text }: { text: string }): React.JSX.Element {
  * 「默认展开目录」设置需要一次性初始化，这两件事都要求有一个统一的入口。
  */
 export function TocPanel(): React.JSX.Element {
-  const container = useScrollContainer();
+  const view = useEditorView();
   const toc = useDocumentStore((state) => state.toc);
   const hasDocument = useDocumentStore((state) => state.document !== null);
   const setActiveHeadingId = useDocumentStore((state) => state.setActiveHeadingId);
+  const markNavigation = useDocumentStore((state) => state.markNavigation);
   const expandByDefault = useSettingsStore((state) => state.settings.reading.expandTocByDefault);
 
   const [query, setQuery] = useState('');
@@ -72,14 +75,47 @@ export function TocPanel(): React.JSX.Element {
     [expandByDefault],
   );
 
+  /**
+   * 点击目录项跳到对应标题。
+   *
+   * 从「按 id 查 DOM 元素再 scrollIntoView」改成 `scrollToLine`：编辑器只
+   * 渲染视口附近的块，视口外的标题根本不在 DOM 里，查不到就整个跳转失效——
+   * 而「跳到远处的某一节」恰恰是目录最主要的用途。
+   *
+   * `view` 为空（文档还没就绪）时只更新高亮不滚动：这时候也没有内容可跳，
+   * 地址栏也就没什么可写——写了也是一个指向空文档的链接。
+   *
+   * 注意这道判断**只是**「编辑器就绪了没有」，不代表滚动真的发生了。刻意不去
+   * 确认落点：
+   * 1. 判据本身有二义性——目标本来就在当前位置时，不动才是对的；
+   * 2. 要确认就得等滚动落定（`afterScrollSettles`），地址栏因此晚一百多毫秒
+   *    才更新，而用户此刻正盯着它；
+   * 3. 下面那行高亮是**无条件**写的，另外两条跳转路径（地址栏锚点、正文
+   *    `#锚点` 链接）也都无条件写地址栏。只给这一条加前提，三处就对不齐了。
+   * 「点了却没跳」是定位机制自己的缺陷（估算高度、块身份），要在那里修，
+   * 不该由目录面板用「那我不写地址栏了」来掩盖。
+   *
+   * `markNavigation` 的位置有两条要求，强弱不同：
+   * - **必须在这个同步流程里**。`scrollToLine` 的 dispatch 会同步触发视口变化，
+   *   `enhanceMounted` 随即发起、并在**至少一个微任务之后**回调 `onEnhanced`
+   *   （`MarkdownEditor` 里那个 `.then()`）。所以同步路径上放前放后都来得及，
+   *   放在滚动之前只是最不容易读错的写法；真正来不及的是「等滚动落定再撤防」
+   *   ——那正是「恢复阅读位置后第一次点目录没反应」的成因，见
+   *   `useReadingPosition` 的 `isDisarmed`。
+   * - **必须在 `if (view)` 之内**。view 为空时压根没跳，白撤一次防会吃掉一次
+   *   本该发生的阅读位置恢复。下面那行高亮无条件写，理由见上，两者不是一回事。
+   */
   const handleSelect = useCallback(
-    (id: string) => {
-      const heading = container?.querySelector<HTMLElement>(`[id="${CSS.escape(id)}"]`);
-      heading?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      // 立刻给出反馈，不等平滑滚动结束后 Scroll Spy 再确认
+    (id: string, line: number) => {
+      if (view) {
+        markNavigation();
+        scrollToLine(view, line);
+        syncAnchorHash(id);
+      }
+      // 立刻给出反馈，不等滚动落定后 Scroll Spy 再确认
       setActiveHeadingId(id);
     },
-    [container, setActiveHeadingId],
+    [view, setActiveHeadingId, markNavigation],
   );
 
   // 目录跟随正文：高亮项滚出侧栏视野时把它带回来

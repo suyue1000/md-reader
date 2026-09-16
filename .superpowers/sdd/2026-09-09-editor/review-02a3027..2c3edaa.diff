@@ -1,0 +1,71 @@
+# Review package: 02a3027..HEAD
+
+## Commits
+2c3edaa docs: 补充 editable 与 readOnly 独立性的注释
+
+## Files changed
+ src/editor/live-preview.ts | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+## Diff
+diff --git a/src/editor/live-preview.ts b/src/editor/live-preview.ts
+index 8c5c33c..a3c820f 100644
+--- a/src/editor/live-preview.ts
++++ b/src/editor/live-preview.ts
+@@ -83,20 +83,30 @@ class BlockWidget extends WidgetType {
+   override ignoreEvent(): boolean {
+     return true;
+   }
+ }
+ 
+ /** 由块列表与选区算出装饰集 */
+ function buildDecorations(view: EditorView, cache: BlockCache): DecorationSet {
+   const blocks = view.state.field(blocksField);
+   if (blocks.length === 0) return Decoration.none;
+ 
++  /**
++   * 只读态下不存在「光标所在的块」，因此所有块都渲染。
++   *
++   * 判据用 `EditorView.editable` 而不是 `EditorState.readOnly`：前者管的是
++   * 「这个视图能不能获得编辑焦点」，后者只管「事务能不能改文档」。二者在
++   * CodeMirror 里是独立的两档开关——只设 readOnly 的话视图仍可聚焦、仍有
++   * 选区，于是光标所在的块会当场变回源码，阅读体验就破了。
++   *
++   * 所以配置这个扩展的地方**必须同时**设置这两项。
++   */
+   const editable = view.state.facet(EditorView.editable);
+   const selection = editable
+     ? {
+         fromLine: view.state.doc.lineAt(view.state.selection.main.from).number - 1,
+         toLine: view.state.doc.lineAt(view.state.selection.main.to).number - 1,
+       }
+     : null;
+ 
+   const lineCount = view.state.doc.lines;
+   const decorations = [];
+@@ -124,20 +134,25 @@ function buildDecorations(view: EditorView, cache: BlockCache): DecorationSet {
+ }
+ 
+ /**
+  * 实时预览扩展。
+  *
+  * 用 ViewPlugin 而不是 StateField 产出装饰：装饰依赖 `EditorView.editable`
+  * 这个 facet 与视图本身，而 StateField 拿不到 view。
+  *
+  * cache 通过 `ViewPlugin.fromClass` 的闭包传入，而不是模块级单例：
+  * 模块级单例在同时存在两个编辑器实例时会互相串味。
++ *
++ * 配置只读视图时，务必同时设置 `EditorView.editable.of(false)` 与
++ * `EditorState.readOnly.of(true)`——本扩展判断「阅读态」用的是前者
++ * （见 `buildDecorations` 里的说明），只设后者会导致光标所在的块
++ * 在只读视图里仍然被打回源码。
+  */
+ export function livePreview(cache: BlockCache): Extension {
+   const plugin = ViewPlugin.fromClass(
+     class {
+       decorations: DecorationSet;
+       constructor(view: EditorView) {
+         this.decorations = buildDecorations(view, cache);
+       }
+       update(update: ViewUpdate): void {
+         if (update.docChanged || update.selectionSet || update.viewportChanged) {

@@ -20,6 +20,27 @@ const cache = new Map<string, ReadingPosition>();
 /** 是否已从存储恢复过 */
 let hydrated = false;
 
+/**
+ * 存储里读回来的一条记录是不是当前结构。
+ *
+ * 必须校验，不能直接断言类型。这个结构**改过一次**：早期版本存的是
+ * 「滚动比例 + 锚点 id + 锚点内偏移」，改用编辑器之后换成了「行号 + 行内偏移」。
+ * 老版本留在 chrome.storage 里的记录没有 `line` 字段，直接当新结构用，
+ * `position.line` 就是 `undefined`——它会一路传到 `scrollToLine`，
+ * `undefined + 1` 得到 `NaN`，而 CodeMirror 的边界检查
+ * （`n < 1 || n > lines`）对 NaN 两侧都为假、**恰好放行**，最终在它内部
+ * 抛出一个与真正原因毫无关系的 TypeError，整个阅读器白屏。
+ *
+ * 结构不认识就丢掉，不做转换：比例换行号需要知道文档有多少行，而这里
+ * 只有存储数据、没有文档。丢掉的代价是升级后第一次打开老文档会从头开始，
+ * 用户滚一下就重新存上了；而留着一条会让阅读器崩溃的记录，代价是整页打不开。
+ */
+function isCurrentShape(value: unknown): value is ReadingPosition {
+  if (typeof value !== 'object' || value === null) return false;
+  const record = value as Partial<ReadingPosition>;
+  return Number.isFinite(record.line) && Number.isFinite(record.offset);
+}
+
 /** 写盘（防抖）——滚动时高频触发，不能每次都写 */
 const persist = debounce(() => {
   const record: Record<string, ReadingPosition> = {};
@@ -48,6 +69,8 @@ export async function hydrateReadingPositions(): Promise<void> {
     {},
   );
   for (const [id, position] of Object.entries(stored)) {
+    // 结构对不上的（上一个版本留下的记录）直接丢弃，理由见 isCurrentShape
+    if (!isCurrentShape(position)) continue;
     // 存储里的记录不覆盖本次会话中已经产生的更新
     if (!cache.has(id)) cache.set(id, position);
   }
@@ -78,73 +101,6 @@ export function recallPosition(documentId: string): ReadingPosition | undefined 
  */
 export function flushReadingPositions(): void {
   persist.flush();
-}
-
-/**
- * 在有序的标题偏移量数组里，找出最后一个不超过当前滚动位置的标题下标。
- *
- * 用二分而不是线性扫描：保存位置是滚动过程中的高频操作，几百个标题时
- * 线性扫描累加起来会吃掉可观的主线程时间。标题的 `offsetTop` 天然按
- * 文档顺序递增，正好满足二分的前提。
- *
- * @returns 命中的下标；滚动位置在第一个标题之上时返回 -1
- */
-export function findAnchorIndex(offsets: readonly number[], scrollTop: number): number {
-  let low = 0;
-  let high = offsets.length - 1;
-  let found = -1;
-
-  while (low <= high) {
-    const mid = (low + high) >> 1;
-    const offset = offsets[mid];
-    if (offset === undefined) break;
-    if (offset <= scrollTop) {
-      found = mid;
-      low = mid + 1;
-    } else {
-      high = mid - 1;
-    }
-  }
-
-  return found;
-}
-
-/** 一份文档的标题锚点索引 */
-export interface AnchorIndex {
-  /** 标题 id，按文档顺序 */
-  ids: readonly string[];
-  /** 对应的 offsetTop，与 ids 一一对应且递增 */
-  offsets: readonly number[];
-}
-
-/**
- * 计算应该滚动到的位置。
- *
- * 这是整个阅读位置功能的核心判断，也是唯一容易出错的地方，所以抽成纯函数：
- * - **锚点仍在**：用「锚点当前的 offsetTop + 保存时的相对偏移」。
- *   这样即使锚点上方新增或删除了内容（自动刷新最常见的情形），
- *   用户看到的仍然是原来那一段文字；
- * - **锚点已消失**（标题被删或改名）：回落到比例定位，虽不精确但不会跳到顶部；
- * - **保存时就在首个标题之上**：按比例定位。
- *
- * @param position 保存的位置
- * @param anchors 当前文档的锚点索引
- * @param scrollable 可滚动高度（scrollHeight - clientHeight）
- * @returns 目标 scrollTop，已裁剪为非负
- */
-export function computeRestoreTarget(
-  position: ReadingPosition,
-  anchors: AnchorIndex,
-  scrollable: number,
-): number {
-  const anchorIndex = position.anchorId ? anchors.ids.indexOf(position.anchorId) : -1;
-
-  const target =
-    anchorIndex >= 0
-      ? (anchors.offsets[anchorIndex] ?? 0) + position.anchorOffset
-      : position.ratio * Math.max(0, scrollable);
-
-  return Math.max(0, target);
 }
 
 /** 清空全部记录（测试与「恢复默认」用） */

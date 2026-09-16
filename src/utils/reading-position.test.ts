@@ -1,136 +1,24 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   clearReadingPositions,
-  computeRestoreTarget,
-  findAnchorIndex,
+  flushReadingPositions,
+  hydrateReadingPositions,
   recallPosition,
   rememberPosition,
 } from './reading-position';
-import { createMemoryStorageDriver, setStorageDriver } from './storage';
+import {
+  STORAGE_AREAS,
+  STORAGE_KEYS,
+  createMemoryStorageDriver,
+  setStorageDriver,
+  writeValue,
+} from './storage';
 import type { ReadingPosition } from '@/types';
 
 /** 构造一条位置记录 */
 function makePosition(documentId: string, updatedAt = Date.now()): ReadingPosition {
-  return { documentId, ratio: 0.5, anchorId: 'h1', anchorOffset: 20, updatedAt };
+  return { documentId, line: 42, offset: 8, updatedAt };
 }
-
-describe('findAnchorIndex', () => {
-  const offsets = [0, 100, 250, 900, 1500];
-
-  it('返回最后一个不超过滚动位置的下标', () => {
-    expect(findAnchorIndex(offsets, 260)).toBe(2);
-    expect(findAnchorIndex(offsets, 900)).toBe(3);
-    expect(findAnchorIndex(offsets, 99999)).toBe(4);
-  });
-
-  it('正好落在某个标题上时命中该标题', () => {
-    expect(findAnchorIndex(offsets, 250)).toBe(2);
-  });
-
-  it('滚动位置在第一个标题之上时返回 -1', () => {
-    expect(findAnchorIndex([100, 200], 50)).toBe(-1);
-  });
-
-  it('空数组返回 -1', () => {
-    expect(findAnchorIndex([], 100)).toBe(-1);
-  });
-
-  it('与线性扫描的结果一致（随机对照）', () => {
-    // 二分容易在边界上写错，用朴素实现做交叉验证
-    const random = Array.from({ length: 200 }, (_, i) => i * 37);
-    for (const probe of [0, 1, 36, 37, 3699, 7400, 99999]) {
-      const linear = random.reduce((acc, offset, index) => (offset <= probe ? index : acc), -1);
-      expect(findAnchorIndex(random, probe)).toBe(linear);
-    }
-  });
-});
-
-describe('computeRestoreTarget', () => {
-  /** 三个标题的文档 */
-  const anchors = { ids: ['intro', 'usage', 'api'], offsets: [0, 800, 1600] };
-
-  it('锚点未移动时回到原位', () => {
-    const position: ReadingPosition = {
-      documentId: 'doc',
-      ratio: 0.5,
-      anchorId: 'usage',
-      anchorOffset: 120,
-      updatedAt: 0,
-    };
-    expect(computeRestoreTarget(position, anchors, 3000)).toBe(920);
-  });
-
-  it('锚点上方新增内容后跟着锚点走', () => {
-    // 自动刷新最常见的情形：文档上方被追加了内容，所有锚点整体下移
-    const position: ReadingPosition = {
-      documentId: 'doc',
-      ratio: 0.26,
-      anchorId: 'usage',
-      anchorOffset: 120,
-      updatedAt: 0,
-    };
-    const shifted = { ids: ['intro', 'usage', 'api'], offsets: [0, 2000, 2800] };
-
-    // 若按比例定位会落在 ~1100，只有按锚点才能回到用户原来读的那一段
-    expect(computeRestoreTarget(position, shifted, 4200)).toBe(2120);
-  });
-
-  it('锚点上方内容被删除后同样跟随', () => {
-    const position: ReadingPosition = {
-      documentId: 'doc',
-      ratio: 0.5,
-      anchorId: 'api',
-      anchorOffset: 50,
-      updatedAt: 0,
-    };
-    const shrunk = { ids: ['intro', 'usage', 'api'], offsets: [0, 300, 700] };
-    expect(computeRestoreTarget(position, shrunk, 2000)).toBe(750);
-  });
-
-  it('锚点已消失时回落到比例定位', () => {
-    const position: ReadingPosition = {
-      documentId: 'doc',
-      ratio: 0.5,
-      anchorId: 'removed-heading',
-      anchorOffset: 120,
-      updatedAt: 0,
-    };
-    expect(computeRestoreTarget(position, anchors, 3000)).toBe(1500);
-  });
-
-  it('保存时就在首个标题之上时按比例定位', () => {
-    const position: ReadingPosition = {
-      documentId: 'doc',
-      ratio: 0.1,
-      anchorId: null,
-      anchorOffset: 0,
-      updatedAt: 0,
-    };
-    expect(computeRestoreTarget(position, anchors, 2000)).toBe(200);
-  });
-
-  it('结果不会为负', () => {
-    const position: ReadingPosition = {
-      documentId: 'doc',
-      ratio: 0.5,
-      anchorId: 'intro',
-      anchorOffset: -500,
-      updatedAt: 0,
-    };
-    expect(computeRestoreTarget(position, anchors, 1000)).toBe(0);
-  });
-
-  it('文档变得不可滚动时回到顶部', () => {
-    const position: ReadingPosition = {
-      documentId: 'doc',
-      ratio: 0.8,
-      anchorId: null,
-      anchorOffset: 0,
-      updatedAt: 0,
-    };
-    expect(computeRestoreTarget(position, { ids: [], offsets: [] }, -10)).toBe(0);
-  });
-});
 
 describe('阅读位置缓存', () => {
   beforeEach(() => {
@@ -140,7 +28,12 @@ describe('阅读位置缓存', () => {
 
   it('记录后可以读回', () => {
     rememberPosition(makePosition('doc:a'), false);
-    expect(recallPosition('doc:a')?.anchorId).toBe('h1');
+    expect(recallPosition('doc:a')?.line).toBe(42);
+  });
+
+  it('记录与读回行号', () => {
+    rememberPosition({ documentId: 'doc:a', line: 42, offset: 8, updatedAt: Date.now() }, false);
+    expect(recallPosition('doc:a')?.line).toBe(42);
   });
 
   it('未记录的文档返回 undefined', () => {
@@ -171,5 +64,48 @@ describe('阅读位置缓存', () => {
     rememberPosition(makePosition('doc:c'), false);
     clearReadingPositions();
     expect(recallPosition('doc:c')).toBeUndefined();
+  });
+
+  it('hydrate 后不覆盖本次会话中已经产生的更新', async () => {
+    // 存储恢复只补空位，不能拿旧数据覆盖同一会话里更新过的记录
+    rememberPosition({ documentId: 'doc:d', line: 5, offset: 0, updatedAt: Date.now() }, false);
+    await hydrateReadingPositions();
+    expect(recallPosition('doc:d')?.line).toBe(5);
+  });
+
+  it('flush 不抛出', () => {
+    rememberPosition(makePosition('doc:e'), true);
+    expect(() => flushReadingPositions()).not.toThrow();
+  });
+});
+
+describe('旧版本遗留的存储记录', () => {
+  beforeEach(() => {
+    setStorageDriver(createMemoryStorageDriver());
+    // 顺带把 hydrated 标志复位，否则第二个用例读不到自己写的数据
+    clearReadingPositions();
+  });
+
+  it('丢弃缺少 line 字段的记录，而不是把 undefined 交出去', async () => {
+    // 改造之前的结构：滚动比例 + 锚点，没有 line / offset
+    const legacy = {
+      'doc:old': { documentId: 'doc:old', ratio: 0.5, anchorId: 'x', anchorOffset: 12, updatedAt: 1 },
+    };
+    await writeValue(STORAGE_AREAS.readingPositions, STORAGE_KEYS.readingPositions, legacy);
+
+    await hydrateReadingPositions();
+
+    // 关键：不能返回一个 line 为 undefined 的对象——那会让 scrollToLine 收到 NaN
+    expect(recallPosition('doc:old')).toBeUndefined();
+  });
+
+  it('结构正确的记录照常读回', async () => {
+    await writeValue(STORAGE_AREAS.readingPositions, STORAGE_KEYS.readingPositions, {
+      'doc:new': { documentId: 'doc:new', line: 42, offset: 8, updatedAt: 1 },
+    });
+
+    await hydrateReadingPositions();
+
+    expect(recallPosition('doc:new')?.line).toBe(42);
   });
 });

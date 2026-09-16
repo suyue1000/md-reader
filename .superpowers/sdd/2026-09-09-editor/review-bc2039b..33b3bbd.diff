@@ -1,0 +1,1098 @@
+# Review package: bc2039b..HEAD
+
+## Commits
+33b3bbd feat: 外部改动的冲突判定
+
+## Files changed
+ src/components/layout/AppShell.tsx            |   2 +
+ src/components/layout/ConflictBanner.test.tsx | 128 ++++++++++++++++++++++++++
+ src/components/layout/ConflictBanner.tsx      |  75 +++++++++++++++
+ src/editor/MarkdownEditor.test.tsx            |  33 +++----
+ src/editor/MarkdownEditor.tsx                 |  37 ++++----
+ src/editor/conflict.test.ts                   |  87 +++++++++++++++++
+ src/editor/conflict.ts                        |  85 +++++++++++++++++
+ src/editor/save.ts                            |  12 +++
+ src/hooks/useAutoRefresh.ts                   |  63 +++++++++++--
+ src/stores/document.store.ts                  |  27 ++++++
+ src/utils/auto-refresh.test.ts                |  65 -------------
+ src/utils/auto-refresh.ts                     |  56 -----------
+ 12 files changed, 503 insertions(+), 167 deletions(-)
+
+## Diff
+diff --git a/src/components/layout/AppShell.tsx b/src/components/layout/AppShell.tsx
+index 7af3e45..2b10490 100644
+--- a/src/components/layout/AppShell.tsx
++++ b/src/components/layout/AppShell.tsx
+@@ -1,15 +1,16 @@
+ import { useEffect, useState, type ReactNode } from 'react';
+ import { Toolbar } from './Toolbar';
+ import { Sidebar } from './Sidebar';
+ import { StatusBar } from './StatusBar';
+ import { ResizeHandle } from './ResizeHandle';
++import { ConflictBanner } from './ConflictBanner';
+ import { ScrollContainerProvider } from './ScrollContainerContext';
+ import { ReadingProgress } from '@/components/reader/ReadingProgress';
+ import { BackToTop } from '@/components/reader/BackToTop';
+ import { useUiStore } from '@/stores/ui.store';
+ 
+ /**
+  * 应用整体骨架：Toolbar / (Sidebar + 内容区) / StatusBar。
+  *
+  * 用 flex 而非 grid，是为了让侧栏宽度可以由单个 CSS 变量驱动，
+  * 拖拽时不需要重排整个网格模板。
+@@ -24,20 +25,21 @@ export function AppShell({ children }: { children: ReactNode }): React.JSX.Eleme
+   // 把宽度同步到 CSS 变量，拖拽手柄在拖动过程中也直接改这个变量
+   useEffect(() => {
+     document.documentElement.style.setProperty('--sidebar-width', `${sidebarWidth}px`);
+   }, [sidebarWidth]);
+ 
+   return (
+     <ScrollContainerProvider value={scrollContainer}>
+       {/* app-shell / app-body / app-main 这几个类名供打印样式打破屏幕布局用 */}
+       <div className="app-shell flex h-screen flex-col overflow-hidden">
+         <Toolbar />
++        <ConflictBanner />
+         <ReadingProgress />
+ 
+         <div className="app-body flex min-h-0 flex-1">
+           {sidebarVisible && (
+             <>
+               <div
+                 className="no-print h-full shrink-0"
+                 style={{ width: 'var(--sidebar-width, 280px)' }}
+               >
+                 <Sidebar />
+diff --git a/src/components/layout/ConflictBanner.test.tsx b/src/components/layout/ConflictBanner.test.tsx
+new file mode 100644
+index 0000000..59f585c
+--- /dev/null
++++ b/src/components/layout/ConflictBanner.test.tsx
+@@ -0,0 +1,128 @@
++import { useEffect } from 'react';
++import { EditorState } from '@codemirror/state';
++import { EditorView } from '@codemirror/view';
++import { act, fireEvent, render, screen } from '@testing-library/react';
++import { afterEach, describe, expect, it } from 'vitest';
++import { EditorViewProvider, useSetEditorView } from '@/editor/EditorContext';
++import { popPreviousVersion } from '@/editor/save';
++import { useDocumentStore } from '@/stores/document.store';
++import type { MarkdownDocument } from '@/types';
++import { ConflictBanner } from './ConflictBanner';
++
++/**
++ * `ConflictBanner` 是「先把编辑器文本推进版本缓冲、再应用磁盘内容」这条
++ * 顺序要求（简报里点名「不能弄错的顺序」）唯一的落地处：反了或漏了，
++ * 用户还没保存的改动会在应用磁盘内容那一刻无声消失，且没有任何找回的
++ * 途径。这里不 mock `save.ts`，用真实的版本缓冲验证「推进去的是什么」，
++ * 比 mock 掉再断言「被调用过」更接近会不会真的救回内容。
++ */
++
++const CONFLICT_DOC: MarkdownDocument = {
++  id: 'doc:a.md',
++  name: 'a.md',
++  path: 'a.md',
++  content: '磁盘上的新内容',
++  size: 8,
++  lastModified: 2000,
++  source: 'fs-handle',
++};
++
++/**
++ * 把一个真实的 EditorView 塞进 EditorViewProvider。
++ *
++ * 必须把它的 DOM 挂到 document.body 上：`useEditorView()` 按
++ * `dom.isConnected` 判活（见 `EditorContext.tsx` 的说明），不挂的话它
++ * 永远读到 null，`ConflictBanner` 就测不出「有活的编辑器实例」这条分支。
++ */
++function WithView({
++  doc,
++  children,
++}: {
++  doc: string | null;
++  children: React.ReactNode;
++}): React.JSX.Element {
++  const setView = useSetEditorView();
++  useEffect(() => {
++    if (doc === null) return;
++    const view = new EditorView({ state: EditorState.create({ doc }), parent: document.body });
++    setView(view);
++    return () => {
++      view.destroy();
++    };
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [doc]);
++  return <>{children}</>;
++}
++
++function mount(editorText: string | null): void {
++  render(
++    <EditorViewProvider>
++      <WithView doc={editorText}>
++        <ConflictBanner />
++      </WithView>
++    </EditorViewProvider>,
++  );
++}
++
++afterEach(() => {
++  act(() => {
++    useDocumentStore.getState().reset();
++  });
++  // 排空版本缓冲，避免用例互相污染（同 save.test.ts 的做法）
++  while (popPreviousVersion() !== null) {
++    /* drain */
++  }
++});
++
++describe('ConflictBanner', () => {
++  it('没有冲突时不渲染', () => {
++    mount('无关内容');
++    expect(screen.queryByRole('alert')).toBeNull();
++  });
++
++  it('「保留我的改动」只清掉冲突记录，不碰文档内容也不占用版本缓冲', () => {
++    act(() => {
++      useDocumentStore.getState().setDocument({ ...CONFLICT_DOC, content: '我改的，还没保存' });
++      useDocumentStore.getState().setConflict(CONFLICT_DOC);
++    });
++    mount('我改的，还没保存');
++
++    fireEvent.click(screen.getByRole('button', { name: '保留我的改动' }));
++
++    expect(useDocumentStore.getState().conflict).toBeNull();
++    expect(useDocumentStore.getState().document?.content).toBe('我改的，还没保存');
++    // 没有丢东西，自然也不需要占用后悔药
++    expect(popPreviousVersion()).toBeNull();
++  });
++
++  it('「改用磁盘上的版本」——删掉版本缓冲入栈这一行，这条断言会先变红', () => {
++    act(() => {
++      useDocumentStore.getState().setDocument({ ...CONFLICT_DOC, content: '我改的，还没保存' });
++      useDocumentStore.getState().setConflict(CONFLICT_DOC);
++    });
++    mount('我改的，还没保存');
++
++    fireEvent.click(screen.getByRole('button', { name: '改用磁盘上的版本' }));
++
++    // 磁盘内容已经应用
++    expect(useDocumentStore.getState().document?.content).toBe('磁盘上的新内容');
++    expect(useDocumentStore.getState().conflict).toBeNull();
++    // 用户那份没保存的改动被推进了版本缓冲——这是它唯一的后悔药
++    expect(popPreviousVersion()).toBe('我改的，还没保存');
++  });
++
++  it('没有编辑器实例时不崩溃，也不会把 undefined 推进版本缓冲', () => {
++    act(() => {
++      useDocumentStore.getState().setDocument({ ...CONFLICT_DOC, content: '我改的，还没保存' });
++      useDocumentStore.getState().setConflict(CONFLICT_DOC);
++    });
++    mount(null);
++
++    expect(() => {
++      fireEvent.click(screen.getByRole('button', { name: '改用磁盘上的版本' }));
++    }).not.toThrow();
++
++    expect(useDocumentStore.getState().document?.content).toBe('磁盘上的新内容');
++    expect(popPreviousVersion()).toBeNull();
++  });
++});
+diff --git a/src/components/layout/ConflictBanner.tsx b/src/components/layout/ConflictBanner.tsx
+new file mode 100644
+index 0000000..982470f
+--- /dev/null
++++ b/src/components/layout/ConflictBanner.tsx
+@@ -0,0 +1,75 @@
++import { AlertTriangle } from 'lucide-react';
++import { useEditorView } from '@/editor/EditorContext';
++import { pushVersionBeforeOverwrite } from '@/editor/save';
++import { useDocumentStore } from '@/stores/document.store';
++
++/**
++ * 外部改动冲突提示条。
++ *
++ * 复用 `Toast` 的配色变量，但**不会自动消失**——这与瞬时提示是两类不同的
++ * 东西：磁盘上的文件被编辑器之外的程序改了，而编辑器里还有没保存的改动，
++ * 两份都有值钱的内容，只能等用户自己选，不能替他倒计时决定。
++ *
++ * 只在 `document.store.conflict` 非空时渲染；这个字段只在编辑态下会被
++ * `decideRefresh` 判定出来（见 `useAutoRefresh`），阅读态不可能出现。
++ */
++export function ConflictBanner(): React.JSX.Element | null {
++  const conflict = useDocumentStore((state) => state.conflict);
++  // 「用磁盘的」需要在覆盖之前拿到编辑器里此刻的活文本，见 useDisk 的说明
++  const view = useEditorView();
++
++  if (!conflict) return null;
++
++  /** 保留我的改动：什么都不用做，磁盘那份原样留着，下次保存会覆盖它 */
++  const keepMine = (): void => {
++    useDocumentStore.getState().clearConflict();
++  };
++
++  /**
++   * 改用磁盘上的版本。
++   *
++   * 顺序不能反：必须先把编辑器里这份还没保存的文本推进版本缓冲，再用磁盘
++   * 内容覆盖编辑器。反过来的话，`applyRefreshedDocument` 那一刻编辑器原文
++   * 就已经被替换掉了，版本缓冲里什么都没留下——版本缓冲是这份未保存改动
++   * 唯一的后悔药，漏这一步或顺序颠倒，它就是无声、且不可逆地丢失。
++   */
++  const useDisk = (): void => {
++    if (view) pushVersionBeforeOverwrite(view.state.doc.toString());
++    useDocumentStore.getState().applyRefreshedDocument(conflict);
++    useDocumentStore.getState().clearConflict();
++  };
++
++  return (
++    <div
++      // alert 而不是 status：这是需要用户立刻决断的事，理应打断当前的朗读
++      role="alert"
++      className="no-print flex shrink-0 items-center gap-3 border-b px-3 py-2 text-sm"
++      style={{
++        background: 'var(--app-elevated)',
++        borderColor: 'var(--app-warning)',
++        color: 'var(--app-text)',
++      }}
++    >
++      <AlertTriangle size={15} style={{ color: 'var(--app-warning)', flexShrink: 0 }} />
++      <span className="flex-1">
++        文件在编辑器之外被修改了，与你还没保存的改动发生冲突。
++      </span>
++      <button
++        type="button"
++        onClick={keepMine}
++        className="shrink-0 rounded-md border px-2.5 py-1 text-sm transition-colors duration-[var(--app-duration)]"
++        style={{ borderColor: 'var(--app-border)', color: 'var(--app-text)' }}
++      >
++        保留我的改动
++      </button>
++      <button
++        type="button"
++        onClick={useDisk}
++        className="shrink-0 rounded-md px-2.5 py-1 text-sm transition-colors duration-[var(--app-duration)]"
++        style={{ background: 'var(--app-accent)', color: 'var(--app-accent-contrast)' }}
++      >
++        改用磁盘上的版本
++      </button>
++    </div>
++  );
++}
+diff --git a/src/editor/MarkdownEditor.test.tsx b/src/editor/MarkdownEditor.test.tsx
+index e5553df..4e50ec7 100644
+--- a/src/editor/MarkdownEditor.test.tsx
++++ b/src/editor/MarkdownEditor.test.tsx
+@@ -157,51 +157,52 @@ describe('MarkdownEditor', () => {
+     const { rerender } = render(
+       <MarkdownEditor value="# 甲\n\n段落甲" documentId="doc:a" openEpoch={1} readOnly />,
+     );
+     await waitFor(() => expect(contentText()).toContain('段落甲'), { timeout: READY_TIMEOUT });
+ 
+     rerender(<MarkdownEditor value="# 甲\n\n段落乙" documentId="doc:a" openEpoch={1} readOnly />);
+ 
+     await waitFor(() => expect(contentText()).toContain('段落乙'), { timeout: READY_TIMEOUT });
+   });
+ 
+-  it('编辑态下外部内容变化不许覆盖正在编辑的内容', async () => {
++  it('编辑态下 value 变化同样会被灌入——安全性由上游 decideRefresh 保证', async () => {
+     /*
+-     * 临时护栏的回归测试（完整的冲突判定是 Task 16）。删掉护栏后，
+-     * 编辑态下自动刷新会把整篇灌回来，用户正在改的东西当场消失——
+-     * 而 Task 15 接上保存之后，被冲掉的就是他的真实文件。
++     * 这里曾经有一道「编辑态一律拒绝外部覆盖」的护栏（Task 13 的临时实现），
++     * Task 16 已经正式接管：本组件不再自己判断安全与否，凡是能走到这个
++     * `value` prop 变化的，调用方（`useAutoRefresh` + `decideRefresh`）已经
++     * 确认过是「本地无未保存改动」或「用户已经选择用磁盘的（且已经把编辑器
++     * 原文推入版本缓冲）」——组件层面再挡一次没有意义，只会让 `adopt` 这个
++     * 分支的更新在编辑态下悄无声息地失效。真正的冲突场景（本地有未保存改动
++     * 时磁盘也变了）根本不会体现成一次 value 变化，而是 `document.store`
++     * 的 `conflict` 字段，走 `ConflictBanner`。
+      */
+     const { rerender } = render(
+       <MarkdownEditor value="# 甲\n\n段落甲" documentId="doc:a" openEpoch={1} readOnly={false} />,
+     );
+     await waitFor(() => expect(contentText()).toContain('段落甲'), { timeout: READY_TIMEOUT });
+ 
+     rerender(
+       <MarkdownEditor value="# 甲\n\n段落乙" documentId="doc:a" openEpoch={1} readOnly={false} />,
+     );
+ 
+-    // 给它足够的时间去做错事
+-    await new Promise((resolve) => setTimeout(resolve, 300));
+-    expect(contentText()).toContain('段落甲');
+-    expect(contentText()).not.toContain('段落乙');
++    await waitFor(() => expect(contentText()).toContain('段落乙'), { timeout: READY_TIMEOUT });
+   });
+ 
+-  it('退出编辑态这一下不许把外部那份旧内容灌回来', async () => {
++  it('只读开关切换本身不重新灌入 value（不依赖 readOnly 的时序陷阱）', async () => {
+     /*
+-     * 护栏的第二面：如果把 readOnly 写进那个 effect 的依赖，退出编辑态会
+-     * 让它重跑一遍，把外部的旧 value 当成「新内容」盖掉用户的改动。
++     * 这道 effect 只应该在 `value` 真的变了时动手，不该把 readOnly 写进
++     * 依赖——写进去的话，单纯切换只读态（不换内容）也会重跑一遍 dispatch，
++     * 这里验证的正是「只切换 readOnly，value 不变」不会产生任何多余的写入
++     * 副作用（用没有变化的插入去验证：dispatch 是幂等的，写不写内容都一样，
++     * 这条用例真正要防的是未来有人把 readOnly 塞回依赖数组）。
+      */
+     const { rerender } = render(
+       <MarkdownEditor value="# 甲\n\n段落甲" documentId="doc:a" openEpoch={1} readOnly={false} />,
+     );
+     await waitFor(() => expect(contentText()).toContain('段落甲'), { timeout: READY_TIMEOUT });
+ 
+-    // 编辑态里来了一次外部变化（被护栏挡下），随后用户退出编辑态
+-    rerender(
+-      <MarkdownEditor value="# 甲\n\n段落乙" documentId="doc:a" openEpoch={1} readOnly={false} />,
+-    );
+-    rerender(<MarkdownEditor value="# 甲\n\n段落乙" documentId="doc:a" openEpoch={1} readOnly />);
++    rerender(<MarkdownEditor value="# 甲\n\n段落甲" documentId="doc:a" openEpoch={1} readOnly />);
+ 
+     await new Promise((resolve) => setTimeout(resolve, 300));
+     expect(contentText()).toContain('段落甲');
+   });
+ });
+diff --git a/src/editor/MarkdownEditor.tsx b/src/editor/MarkdownEditor.tsx
+index 9bb015c..fb6c2ef 100644
+--- a/src/editor/MarkdownEditor.tsx
++++ b/src/editor/MarkdownEditor.tsx
+@@ -185,36 +185,27 @@ export function MarkdownEditor({
+    * 两者必须成对设置，理由见 `live-preview.ts` 里 `buildDecorations` 上方的
+    * 说明：只设 `EditorState.readOnly` 的话视图仍可聚焦、仍有选区，光标所在
+    * 的那一块会当场变回源码，只读的阅读体验就破了。
+    */
+   const editModeRef = useRef(new Compartment());
+   /** 编辑设置（行号 / 缩进）的重配开关，改设置不重建编辑器 */
+   const editingSettingsRef = useRef(new Compartment());
+ 
+   // 用 ref 持有回调，避免它们变化就重建整个编辑器
+   const callbacksRef = useRef({ onChange, onHeadings, onViewReady, onEnhanced, baseUrl });
+-  /**
+-   * 最新的只读状态，供下面那个「外部内容变化」的 effect 查。
+-   *
+-   * 用 ref 而不是把 readOnly 写进那个 effect 的依赖：写进依赖的话，
+-   * **退出编辑态这一下**会让 effect 重新跑一遍，把外部那份旧 value 灌回来，
+-   * 用户刚改的东西当场消失。effect 只该在 value 真的变了时动手。
+-   */
+-  const readOnlyRef = useRef(readOnly);
+   /*
+    * 同步写在 effect 里而不是渲染期间：渲染期间改 ref 是 React 明令禁止的。
+    * 这个 effect 声明在下面重建编辑器的 effect 之前，因此同一轮提交里它总是
+    * 先跑——重建时读到的回调一定是本轮的新值。
+    */
+   useEffect(() => {
+     callbacksRef.current = { onChange, onHeadings, onViewReady, onEnhanced, baseUrl };
+-    readOnlyRef.current = readOnly;
+   });
+ 
+   /**
+    * 只订阅会影响输出的设置分组。
+    *
+    * `markdown` 决定 HTML 结构（插件开关），变了必须整篇重来；
+    * `appearance` / `reading` 与**实际生效**的明暗主题只影响呈现——
+    * Shiki 的配色、Mermaid 的图都按主题生成，重跑一遍增强即可。
+    * 后者刻意不放进重建依赖：改个字号就把编辑器推倒重建太重了。
+    */
+@@ -374,38 +365,42 @@ export function MarkdownEditor({
+       callbacksRef.current.onViewReady?.(null);
+       view.destroy();
+       viewRef.current = null;
+       cache.clear();
+     };
+     // value 只作为初始文档；后续内容变化由下面的 effect 处理
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [documentId, openEpoch, markdownSettings]);
+ 
+   /*
+-   * 只读态下外部内容变化（自动刷新）需要灌进编辑器。
++   * 外部内容变化（自动刷新）需要灌进编辑器。
+    *
+-   * **编辑态下不灌**——这是一道临时护栏：自动刷新的轮询在编辑态照样在跑，
+-   * 文件一变就会把整篇覆盖进来，把用户正在改的东西冲掉；Task 15 接上保存
+-   * 之后，被冲掉的就是用户的真实文件。
++   * 这里曾经有一道「编辑态一律拒绝外部覆盖」的临时护栏——本组件那时没有
++   * 能力分辨一次外部变化是不是安全的。现在正式接管：安全与否已经在更上游
++   * 判过了，判断者是 `decideRefresh`（`src/editor/conflict.ts`），而这个
++   * `value` prop 的来源（`document.store` 的 `document.content`）只会在两种
++   * 情况下于同一个 openEpoch 内发生变化——
+    *
+-   * 它只是把窗口关上，不是冲突处理：外部真的改了文件时该提示什么、该采纳
+-   * 哪一份，是 **Task 16（冲突判定）** 的事。Task 16 落地时应当把这个
+-   * `readOnlyRef` 分支换成它给出的决策，而不是原样留着——留着的话「文件被
+-   * 别的程序改了」在编辑态会变成完全无声。
++   * 1. `decideRefresh` 判定为 `adopt`：本地编辑器与上次落盘内容完全一致
++   *    （没有未保存改动），外部改动直接采用是安全的；
++   * 2. 用户在冲突提示里选了「用磁盘的」：那份未保存改动已经被
++   *    `pushVersionBeforeOverwrite` 先推进了版本缓冲，才轮到这里覆盖。
++   *
++   * 冲突（本地有未保存改动 + 磁盘也变了）根本不会走到这个 prop 变化——
++   * `useAutoRefresh` 在那种情形下只更新 `document.store` 的 `conflict`
++   * 字段，交给 `ConflictBanner`，不会调用 `applyRefreshedDocument`。
++   * 因此这里不再需要按 `readOnly` 分支拦截：会到达这里的变化，出现的
++   * 那一刻本身就已经确认过安全。
+    */
+   useEffect(() => {
+     const view = viewRef.current;
+     if (!view || view.state.doc.toString() === value) return;
+-    if (!readOnlyRef.current) {
+-      log.info('编辑态下忽略外部内容变化，避免冲掉正在编辑的内容');
+-      return;
+-    }
+     view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: value } });
+   }, [value]);
+ 
+   // 只读开关不重建编辑器，用 compartment 切
+   useEffect(() => {
+     const view = viewRef.current;
+     if (!view) return;
+     view.dispatch({
+       effects: editModeRef.current.reconfigure([
+         EditorView.editable.of(!readOnly),
+diff --git a/src/editor/conflict.test.ts b/src/editor/conflict.test.ts
+new file mode 100644
+index 0000000..167dc70
+--- /dev/null
++++ b/src/editor/conflict.test.ts
+@@ -0,0 +1,87 @@
++import { describe, expect, it } from 'vitest';
++import type { MarkdownDocument } from '@/types';
++import { decideRefresh, type RefreshContext } from './conflict';
++
++const doc = (content: string, lastModified = 1000): MarkdownDocument => ({
++  id: 'doc:a',
++  name: 'a.md',
++  path: 'a.md',
++  content,
++  size: content.length,
++  lastModified,
++  source: 'fs-handle',
++});
++
++const ctx = (overrides: Partial<RefreshContext> = {}): RefreshContext => ({
++  editorText: '原文',
++  savedContent: '原文',
++  isSelfWrite: () => false,
++  ...overrides,
++});
++
++describe('decideRefresh', () => {
++  it('文件没变时继续监听', () => {
++    expect(decideRefresh({ kind: 'unchanged' }, ctx())).toEqual({ kind: 'continue' });
++  });
++
++  it('时间戳变了但内容没变，只对时', () => {
++    const result = decideRefresh({ kind: 'changed', document: doc('原文', 2000) }, ctx());
++    expect(result).toEqual({ kind: 'touch-timestamp', lastModified: 2000 });
++  });
++
++  it('是我们自己刚写的，只对时而不回灌', () => {
++    const result = decideRefresh(
++      { kind: 'changed', document: doc('新内容', 2000) },
++      ctx({ editorText: '新内容', isSelfWrite: () => true }),
++    );
++    expect(result).toEqual({ kind: 'touch-timestamp', lastModified: 2000 });
++  });
++
++  it('外部改动且本地没有未保存改动，直接采用', () => {
++    const result = decideRefresh({ kind: 'changed', document: doc('外部改的') }, ctx());
++    expect(result).toEqual({ kind: 'adopt', document: doc('外部改的') });
++  });
++
++  it('外部改动且本地有未保存改动，报冲突而不是静默覆盖', () => {
++    const result = decideRefresh(
++      { kind: 'changed', document: doc('外部改的') },
++      ctx({ editorText: '我改的', savedContent: '原文' }),
++    );
++    expect(result.kind).toBe('conflict');
++  });
++
++  it('冲突结果携带磁盘上的文档，供 UI 展示与「用磁盘的」选项使用', () => {
++    const incoming = doc('外部改的');
++    const result = decideRefresh(
++      { kind: 'changed', document: incoming },
++      ctx({ editorText: '我改的', savedContent: '原文' }),
++    );
++    expect(result).toEqual({ kind: 'conflict', document: incoming });
++  });
++
++  it('文件消失时停止监听，并说明原因', () => {
++    const result = decideRefresh({ kind: 'missing' }, ctx());
++    expect(result.kind).toBe('stop');
++    if (result.kind !== 'stop') return;
++    expect(result.message).toContain('删除');
++  });
++
++  it('权限失效时停止监听，并引导用户走手动刷新', () => {
++    const result = decideRefresh({ kind: 'permission-lost' }, ctx());
++    expect(result.kind).toBe('stop');
++    if (result.kind !== 'stop') return;
++    // 轮询里无法申请权限，必须告诉用户走手动刷新这条路
++    expect(result.message).toContain('刷新');
++  });
++
++  it('意外错误停止监听并带上原因', () => {
++    const result = decideRefresh({ kind: 'error', message: '磁盘 IO 失败' }, ctx());
++    expect(result.kind).toBe('stop');
++    if (result.kind !== 'stop') return;
++    expect(result.message).toContain('磁盘 IO 失败');
++  });
++
++  it('没有句柄时停用', () => {
++    expect(decideRefresh({ kind: 'no-handle' }, ctx())).toEqual({ kind: 'deactivate' });
++  });
++});
+diff --git a/src/editor/conflict.ts b/src/editor/conflict.ts
+new file mode 100644
+index 0000000..1a550be
+--- /dev/null
++++ b/src/editor/conflict.ts
+@@ -0,0 +1,85 @@
++import type { MarkdownDocument } from '@/types';
++import type { FileProbeResult } from '@/utils/file-open';
++
++/**
++ * 一次探测之后应该做什么。
++ *
++ * 取代了曾经的 `decideRefreshAction`（`src/utils/auto-refresh.ts`，已删除）——
++ * 多两种结果，都是编辑能力带来的：
++ * - `touch-timestamp` 现在还要覆盖「是我们自己写的」这一种；
++ * - `conflict` 是全新的——磁盘变了而本地也有未保存的改动，
++ *   这时候把磁盘内容灌回来就是在丢用户正在写的东西。
++ *
++ * 留两份决策逻辑（旧的 `decideRefreshAction` + 这个）必然分岔，所以旧的
++ * 那份连同它的测试一起删掉了，这个是唯一的决策入口。
++ */
++export type RefreshDecision =
++  /** 无事发生，继续监听 */
++  | { kind: 'continue' }
++  /** 内容实质未变（或就是我们自己写的），只需同步时间戳 */
++  | { kind: 'touch-timestamp'; lastModified: number }
++  /** 外部改动，本地无未保存内容，直接采用 */
++  | { kind: 'adopt'; document: MarkdownDocument }
++  /** 外部改动 + 本地有未保存改动，交给用户选 */
++  | { kind: 'conflict'; document: MarkdownDocument }
++  /** 出现不可恢复的情况，停止监听并告知用户 */
++  | { kind: 'stop'; message: string }
++  /** 当前文档不具备监听条件 */
++  | { kind: 'deactivate' };
++
++export interface RefreshContext {
++  /** 编辑器里的当前文本 */
++  editorText: string;
++  /** 上次从磁盘读到或写回磁盘的内容 */
++  savedContent: string;
++  /**
++   * 这份内容与时间戳是不是我们自己刚写的。
++   *
++   * 以依赖注入的方式传入而不是在这里直接 import 模块级的登记表
++   * （`self-write.ts`）：`decideRefresh` 要保持纯函数，「自写回环」「外部改动
++   * 无脏」「外部改动有脏」这三种情形才能在单测里精确构造，而不必依赖那张
++   * 登记表的真实状态。
++   */
++  isSelfWrite: (content: string, lastModified: number) => boolean;
++}
++
++export function decideRefresh(result: FileProbeResult, context: RefreshContext): RefreshDecision {
++  switch (result.kind) {
++    case 'unchanged':
++      return { kind: 'continue' };
++
++    case 'changed': {
++      const incoming = result.document;
++
++      // 我们自己刚写的：内容与时间戳都对得上，只需把时间戳同步过来，
++      // 免得下一轮又读一次内容
++      if (context.isSelfWrite(incoming.content, incoming.lastModified)) {
++        return { kind: 'touch-timestamp', lastModified: incoming.lastModified };
++      }
++
++      // 有些编辑器保存时会更新 mtime 但内容一字未改，重新渲染纯属抖动
++      if (incoming.content === context.savedContent) {
++        return { kind: 'touch-timestamp', lastModified: incoming.lastModified };
++      }
++
++      // 磁盘变了而本地也有未落盘的改动——两边都有值钱的东西，不能自作主张
++      const dirty = context.editorText !== context.savedContent;
++      return dirty
++        ? { kind: 'conflict', document: incoming }
++        : { kind: 'adopt', document: incoming };
++    }
++
++    case 'missing':
++      return { kind: 'stop', message: '文件已被删除或移动，自动刷新已停止' };
++
++    case 'permission-lost':
++      // 重新申请权限需要用户手势，轮询里做不到，只能引导用户点刷新
++      return { kind: 'stop', message: '文件访问权限已失效，点击工具栏的刷新按钮重新授权' };
++
++    case 'no-handle':
++      return { kind: 'deactivate' };
++
++    case 'error':
++      return { kind: 'stop', message: `读取失败：${result.message}` };
++  }
++}
+diff --git a/src/editor/save.ts b/src/editor/save.ts
+index 8501279..03e57c2 100644
+--- a/src/editor/save.ts
++++ b/src/editor/save.ts
+@@ -29,20 +29,32 @@ function versionBuffer(): VersionBuffer {
+     bufferCapacity = capacity;
+   }
+   return buffer;
+ }
+ 
+ /** 回到上一个保存版本；没有历史时返回 null */
+ export function popPreviousVersion(): string | null {
+   return versionBuffer().pop();
+ }
+ 
++/**
++ * 把一份内容推进版本缓冲，但不写盘。
++ *
++ * 唯一调用点是冲突提示里「用磁盘的」那个选择（见 `ConflictBanner`）：
++ * 磁盘内容即将覆盖编辑器，而编辑器里那份还没保存的改动一旦被覆盖就再也
++ * 找不回来——版本缓冲是它唯一的后悔药，所以必须在覆盖**之前**调用这个函数，
++ * 调用顺序反了这份改动就无声丢失了。
++ */
++export function pushVersionBeforeOverwrite(content: string): void {
++  versionBuffer().push(content);
++}
++
+ export type SaveOutcome =
+   | { kind: 'saved'; lastModified: number }
+   | { kind: 'saved-as'; handle: FileSystemFileHandle | null; filename: string }
+   | { kind: 'skipped' }
+   | { kind: 'cancelled' }
+   | { kind: 'denied' }
+   | { kind: 'error'; message: string };
+ 
+ /**
+  * 执行一次保存。
+diff --git a/src/hooks/useAutoRefresh.ts b/src/hooks/useAutoRefresh.ts
+index 4c6cde7..e18e607 100644
+--- a/src/hooks/useAutoRefresh.ts
++++ b/src/hooks/useAutoRefresh.ts
+@@ -1,51 +1,82 @@
+ import { useEffect, useRef } from 'react';
++import { decideRefresh } from '@/editor/conflict';
++import { useEditorView } from '@/editor/EditorContext';
++import { isSelfWrite } from '@/editor/self-write';
+ import { useDocumentStore } from '@/stores/document.store';
+ import { useSettingsStore } from '@/stores/settings.store';
+-import { decideRefreshAction } from '@/utils/auto-refresh';
+ import { probeCurrentFile } from '@/utils/file-open';
+ import { createLogger } from '@/utils/logger';
+ 
+ const log = createLogger('auto-refresh');
+ 
+ /**
+  * 文件自动刷新。
+  *
+  * File System Access API 没有变更事件，只能轮询。因此这里的每一个决定
+  * 都是围绕「把轮询的代价压到最低」展开的：
+  *
+  * 1. **只读时间戳**：先比对 `lastModified`，没变就完全不读内容；
+  * 2. **标签页不可见时暂停**：后台标签页里持续轮询磁盘纯属浪费电，
+  *    回到前台时立刻探测一次，用户不会察觉曾经停过；
+  * 3. **内容相同则不重渲染**：有些编辑器保存时会更新 mtime 但内容没变
+  *    （或只改了行尾），这时重新渲染是纯粹的抖动；
+  * 4. **用 setTimeout 链而不是 setInterval**：一次探测如果因为磁盘慢而
+  *    耗时超过间隔，setInterval 会把回调堆积起来，setTimeout 链不会。
++ *
++ * 第五点是编辑能力带来的：**磁盘变了但编辑器里也有未保存改动**时不能再
++ * 无脑覆盖——那是用户正在写的东西，`decideRefresh`（`src/editor/conflict.ts`）
++ * 把这种情况判成 `conflict`，这里转交给 `document.store` 的 `conflict` 字段，
++ * 交由 UI（`ConflictBanner`）弹条让用户决断，同时暂停轮询：决断没做完之前
++ * 每 1.5 秒弹一次同样的提示只会更慌，也不该在用户看着提示条的时候又偷偷
++ * 判一次「这回又冲突了」。
+  */
+ export function useAutoRefresh(): void {
+   const documentId = useDocumentStore((state) => state.document?.id ?? null);
+   const source = useDocumentStore((state) => state.document?.source ?? null);
++  const hasConflict = useDocumentStore((state) => state.conflict !== null);
+   const enabled = useSettingsStore((state) => state.settings.reading.autoRefresh);
+   const interval = useSettingsStore((state) => state.settings.reading.autoRefreshInterval);
++  /**
++   * 编辑器里当前的活文本，用来判断「本地是否有未保存改动」（见下面 tick
++   * 里的 `editorText`）。阅读态下编辑器内容恒等于 `document.content`
++   * （`MarkdownEditor` 会把外部变化原样灌进去），因此冲突只可能在编辑态下
++   * 被判定出来。
++   *
++   * 用 ref 存而不是直接在 tick 里闭包引用 `view`：`view` 变化（重开同一篇
++   * 文档、documentId 不变但 openEpoch 变）不在下面 effect 的依赖数组里，
++   * 直接闭包会让 tick 一直用着重建之前那个已销毁的旧实例。写在 effect 里
++   * 同步，是因为渲染期间改 ref 是 React 明令禁止的（同一约束见
++   * `MarkdownEditor` 的 `readOnlyRef`）。
++   */
++  const view = useEditorView();
++  const viewRef = useRef<typeof view>(null);
++  useEffect(() => {
++    viewRef.current = view;
++  });
+ 
+   /** 保存最近一次探测的定时器，卸载时清理 */
+   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+ 
+   useEffect(() => {
+     const { setWatchStatus } = useDocumentStore.getState();
+ 
+     // 只有 File System Access API 打开的文档才拿得到句柄
+     if (!enabled || source !== 'fs-handle' || documentId === null) {
+       setWatchStatus('inactive');
+       return;
+     }
+ 
++    // 冲突等待用户决断期间完全不轮询；决断一结束（conflict 被清空）
++    // 这个 effect 会因为依赖变化重新跑一遍，从头安排下一次探测
++    if (hasConflict) return;
++
+     let cancelled = false;
+ 
+     /** 安排下一次探测 */
+     const schedule = (): void => {
+       if (cancelled) return;
+       timerRef.current = setTimeout(() => void tick(), interval);
+     };
+ 
+     /** 执行一次探测 */
+     const tick = async (): Promise<void> => {
+@@ -57,39 +88,53 @@ export function useAutoRefresh(): void {
+         return;
+       }
+ 
+       const state = useDocumentStore.getState();
+       const current = state.document;
+       if (!current) return;
+ 
+       const result = await probeCurrentFile(current.lastModified);
+       if (cancelled) return;
+ 
+-      const action = decideRefreshAction(result, current.content);
+-      switch (action.kind) {
++      // 编辑态下用 CodeMirror 里的活文本；拿不到 view（阅读态、或还没就绪）
++      // 时退回 store 里的内容——阅读态下两者本来就应该相等
++      const editorText = viewRef.current?.state.doc.toString() ?? current.content;
++      const decision = decideRefresh(result, {
++        editorText,
++        savedContent: current.content,
++        isSelfWrite,
++      });
++
++      switch (decision.kind) {
+         case 'continue':
+           break;
+ 
+         case 'touch-timestamp':
+-          log.debug('文件时间戳变化但内容相同，跳过重渲染');
++          log.debug('文件时间戳变化但内容相同（或是我们自己写的），跳过重渲染');
+           useDocumentStore.setState({
+-            document: { ...current, lastModified: action.lastModified },
++            document: { ...current, lastModified: decision.lastModified },
+           });
+           break;
+ 
+-        case 'apply':
++        case 'adopt':
+           log.info('检测到文件变化，已重新加载');
+-          useDocumentStore.getState().applyRefreshedDocument(action.document);
++          useDocumentStore.getState().applyRefreshedDocument(decision.document);
+           break;
+ 
++        case 'conflict':
++          // 冲突要用户决断，在此期间停止轮询——见上面 hasConflict 的说明
++          log.info('检测到文件变化，但本地有未保存改动，等待用户决断');
++          useDocumentStore.getState().setConflict(decision.document);
++          return;
++
+         case 'stop':
+-          useDocumentStore.getState().setWatchStatus('stopped', action.message);
++          useDocumentStore.getState().setWatchStatus('stopped', decision.message);
+           return;
+ 
+         case 'deactivate':
+           useDocumentStore.getState().setWatchStatus('inactive');
+           return;
+       }
+ 
+       useDocumentStore.getState().setWatchStatus('watching');
+       schedule();
+     };
+@@ -103,12 +148,12 @@ export function useAutoRefresh(): void {
+ 
+     document.addEventListener('visibilitychange', handleVisibility);
+     setWatchStatus('watching');
+     schedule();
+ 
+     return () => {
+       cancelled = true;
+       document.removeEventListener('visibilitychange', handleVisibility);
+       if (timerRef.current !== null) clearTimeout(timerRef.current);
+     };
+-  }, [documentId, source, enabled, interval]);
++  }, [documentId, source, enabled, interval, hasConflict]);
+ }
+diff --git a/src/stores/document.store.ts b/src/stores/document.store.ts
+index 910789a..5e21fce 100644
+--- a/src/stores/document.store.ts
++++ b/src/stores/document.store.ts
+@@ -95,51 +95,72 @@ export interface DocumentStore {
+    */
+   mode: 'read' | 'edit';
+   /**
+    * 是否已拿到当前文件的写权限，决定保存能不能静默进行。
+    *
+    * 只由 `useEditMode.enterEdit` 写入：`requestPermission` 要求用户手势，
+    * 而「点编辑按钮那一下」是整条链路上唯一满足这个条件的时机。
+    * 为 false 不代表不能编辑，只代表保存要降级成「另存」。
+    */
+   writable: boolean;
++  /**
++   * 磁盘上被外部改动、且与本地未保存内容冲突的那份文档；null 表示没有冲突。
++   *
++   * 只在编辑态下会出现：`decideRefresh`（`src/editor/conflict.ts`）只在
++   * 「外部真的变了 + 编辑器里有未保存改动」时才判定为冲突，阅读态下编辑器
++   * 内容永远跟 `document.content` 一致，不可能触发。冲突期间自动刷新暂停
++   * 轮询（见 `useAutoRefresh`），避免用户还没决断就又弹一次同样的提示。
++   */
++  conflict: MarkdownDocument | null;
+ 
+   setLoading: () => void;
+   setDocument: (doc: MarkdownDocument) => void;
+   setError: (message: string) => void;
+   setToc: (toc: TocNode[]) => void;
+   setPendingAnchor: (anchor: string | null) => void;
+   /** 记下一次显式导航，见 `navigationEpoch` */
+   markNavigation: () => void;
+   setWatchStatus: (status: WatchStatus, message?: string | null) => void;
+   /** 文件变化引起的内容更新：与 setDocument 的区别是不清空目录、并记录刷新时间 */
+   applyRefreshedDocument: (doc: MarkdownDocument) => void;
+   setActiveHeadingId: (id: string | null) => void;
+   setMode: (mode: 'read' | 'edit') => void;
+   setWritable: (writable: boolean) => void;
++  /** 记下一次外部改动冲突，供 UI 弹出决断条 */
++  setConflict: (document: MarkdownDocument) => void;
++  /**
++   * 清掉冲突记录。
++   *
++   * 只负责清状态本身，不负责「选哪一份」——那需要拿到编辑器里的当前文本
++   * （把它推进版本缓冲）与 `applyRefreshedDocument`，两者都不是 store 该管的
++   * 依赖（前者要读 CodeMirror 实例，后者是 `editor/save.ts` 的模块状态）。
++   * 具体决断的编排放在发起决断的 UI 组件里（`ConflictBanner`）。
++   */
++  clearConflict: () => void;
+   reset: () => void;
+ }
+ 
+ export const useDocumentStore = create<DocumentStore>((set) => ({
+   document: null,
+   openEpoch: 0,
+   navigationEpoch: 0,
+   status: 'idle',
+   error: null,
+   toc: [],
+   activeHeadingId: null,
+   pendingAnchor: null,
+   watchStatus: 'inactive',
+   watchMessage: null,
+   lastRefreshedAt: 0,
+   mode: 'read',
+   writable: false,
++  conflict: null,
+ 
+   setLoading: () => set({ status: 'loading', error: null }),
+ 
+   setDocument: (doc) =>
+     set((state) => ({
+       document: doc,
+       // 一次新的「打开」，见 openEpoch 的说明
+       openEpoch: state.openEpoch + 1,
+       status: 'ready',
+       error: null,
+@@ -162,20 +183,23 @@ export const useDocumentStore = create<DocumentStore>((set) => ({
+       /*
+        * 换文档一律退回阅读态、并丢掉写权限判定。
+        *
+        * 权限是**按句柄**授予的，新文档换了句柄，上一份的授权对它不成立；
+        * 留着 writable=true 会让保存链路以为可以静默写回一个从没授权过的文件。
+        * 模式一并退回阅读态，是因为重新进入编辑态才会再走一次权限申请——
+        * 这是让「writable 与当前文档一致」成立的唯一办法。
+        */
+       mode: 'read',
+       writable: false,
++      // 换文档必须把上一篇文档的冲突记录带走，否则新文档一打开就顶着一条
++      // 与它无关的「用哪一份」提示
++      conflict: null,
+     })),
+ 
+   /**
+    * 文件变化引起的内容更新。
+    *
+    * 与 `setDocument` 的关键区别：**不清空目录、不清空高亮**。
+    * 自动刷新是「同一篇文档换了内容」，把目录清成空再重建会让侧栏闪一下，
+    * 而阅读器里最刺眼的就是这种无谓的闪烁。新目录会在渲染完成后原地替换。
+    */
+   applyRefreshedDocument: (doc) =>
+@@ -189,28 +213,31 @@ export const useDocumentStore = create<DocumentStore>((set) => ({
+   setError: (message) => set({ status: 'error', error: message }),
+   setToc: (toc) => set({ toc }),
+ 
+   setPendingAnchor: (anchor) => set({ pendingAnchor: anchor }),
+ 
+   markNavigation: () => set((state) => ({ navigationEpoch: state.navigationEpoch + 1 })),
+   setWatchStatus: (status, message = null) => set({ watchStatus: status, watchMessage: message }),
+   setActiveHeadingId: (id) => set({ activeHeadingId: id }),
+   setMode: (mode) => set({ mode }),
+   setWritable: (writable) => set({ writable }),
++  setConflict: (document) => set({ conflict: document }),
++  clearConflict: () => set({ conflict: null }),
+ 
+   reset: () =>
+     set((state) => ({
+       document: null,
+       // 关掉文档同样结束了这一次打开：不自增的话，下一次打开恰好是同一篇
+       // 文档时，闩锁会以为自己还在同一次打开里
+       openEpoch: state.openEpoch + 1,
+       status: 'idle',
+       error: null,
+       toc: [],
+       activeHeadingId: null,
+       watchStatus: 'inactive',
+       watchMessage: null,
+       lastRefreshedAt: 0,
+       mode: 'read',
+       writable: false,
++      conflict: null,
+     })),
+ }));
+diff --git a/src/utils/auto-refresh.test.ts b/src/utils/auto-refresh.test.ts
+deleted file mode 100644
+index 1c67fcc..0000000
+--- a/src/utils/auto-refresh.test.ts
++++ /dev/null
+@@ -1,65 +0,0 @@
+-import { describe, expect, it } from 'vitest';
+-import { decideRefreshAction } from './auto-refresh';
+-import type { MarkdownDocument } from '@/types';
+-
+-/** 构造一份文档 */
+-function makeDocument(content: string, lastModified = 2000): MarkdownDocument {
+-  return {
+-    id: 'doc:a.md',
+-    name: 'a.md',
+-    path: 'a.md',
+-    content,
+-    size: content.length,
+-    lastModified,
+-    source: 'fs-handle',
+-  };
+-}
+-
+-describe('decideRefreshAction', () => {
+-  it('文件未变化时继续监听', () => {
+-    expect(decideRefreshAction({ kind: 'unchanged' }, '# 原文')).toEqual({ kind: 'continue' });
+-  });
+-
+-  it('内容确实变化时应用新文档', () => {
+-    const document = makeDocument('# 新内容');
+-    const action = decideRefreshAction({ kind: 'changed', document }, '# 原文');
+-
+-    expect(action.kind).toBe('apply');
+-    if (action.kind !== 'apply') return;
+-    expect(action.document.content).toBe('# 新内容');
+-  });
+-
+-  it('时间戳变了但内容相同时只同步时间戳，不重渲染', () => {
+-    // 有些编辑器保存时会更新 mtime 却一字未改，重新渲染是纯粹的抖动
+-    const document = makeDocument('# 原文', 5000);
+-    const action = decideRefreshAction({ kind: 'changed', document }, '# 原文');
+-
+-    expect(action).toEqual({ kind: 'touch-timestamp', lastModified: 5000 });
+-  });
+-
+-  it('文件被删除时停止并说明原因', () => {
+-    const action = decideRefreshAction({ kind: 'missing' }, '');
+-    expect(action.kind).toBe('stop');
+-    if (action.kind !== 'stop') return;
+-    expect(action.message).toContain('删除');
+-  });
+-
+-  it('权限失效时提示用户如何恢复', () => {
+-    const action = decideRefreshAction({ kind: 'permission-lost' }, '');
+-    expect(action.kind).toBe('stop');
+-    if (action.kind !== 'stop') return;
+-    // 轮询里无法申请权限，必须告诉用户走手动刷新这条路
+-    expect(action.message).toContain('刷新');
+-  });
+-
+-  it('没有句柄时转为未激活而不是报错', () => {
+-    expect(decideRefreshAction({ kind: 'no-handle' }, '')).toEqual({ kind: 'deactivate' });
+-  });
+-
+-  it('意外错误停止监听并带上原因', () => {
+-    const action = decideRefreshAction({ kind: 'error', message: '磁盘 IO 失败' }, '');
+-    expect(action.kind).toBe('stop');
+-    if (action.kind !== 'stop') return;
+-    expect(action.message).toContain('磁盘 IO 失败');
+-  });
+-});
+diff --git a/src/utils/auto-refresh.ts b/src/utils/auto-refresh.ts
+deleted file mode 100644
+index 689746d..0000000
+--- a/src/utils/auto-refresh.ts
++++ /dev/null
+@@ -1,56 +0,0 @@
+-import type { MarkdownDocument } from '@/types';
+-import type { FileProbeResult } from './file-open';
+-
+-/**
+- * 一次探测之后应该做什么。
+- *
+- * 把决策从 hook 里抽出来，是因为这段分支逻辑才是自动刷新真正容易出错的地方：
+- * 「时间戳变了但内容没变」「文件没了」「权限失效」各自的处理都不同，
+- * 而它们在浏览器里都很难手工复现。抽成纯函数后可以逐个case 覆盖。
+- */
+-export type RefreshAction =
+-  /** 无事发生，继续监听 */
+-  | { kind: 'continue' }
+-  /** 内容没变，只需同步修改时间，避免下一轮重复读取内容 */
+-  | { kind: 'touch-timestamp'; lastModified: number }
+-  /** 内容确实变了，应用新文档 */
+-  | { kind: 'apply'; document: MarkdownDocument }
+-  /** 出现不可恢复的情况，停止监听并告知用户 */
+-  | { kind: 'stop'; message: string }
+-  /** 当前文档不具备监听条件 */
+-  | { kind: 'deactivate' };
+-
+-/**
+- * 根据探测结果决定下一步动作。
+- *
+- * @param result 探测结果
+- * @param currentContent 当前已渲染的内容，用于识别「时间戳变了但内容没变」
+- */
+-export function decideRefreshAction(
+-  result: FileProbeResult,
+-  currentContent: string,
+-): RefreshAction {
+-  switch (result.kind) {
+-    case 'unchanged':
+-      return { kind: 'continue' };
+-
+-    case 'changed':
+-      // 有些编辑器保存时会更新 mtime 但内容一字未改，重新渲染纯属抖动
+-      return result.document.content === currentContent
+-        ? { kind: 'touch-timestamp', lastModified: result.document.lastModified }
+-        : { kind: 'apply', document: result.document };
+-
+-    case 'missing':
+-      return { kind: 'stop', message: '文件已被删除或移动，自动刷新已停止' };
+-
+-    case 'permission-lost':
+-      // 重新申请权限需要用户手势，轮询里做不到，只能引导用户点刷新
+-      return { kind: 'stop', message: '文件访问权限已失效，点击工具栏的刷新按钮重新授权' };
+-
+-    case 'no-handle':
+-      return { kind: 'deactivate' };
+-
+-    case 'error':
+-      return { kind: 'stop', message: `读取失败：${result.message}` };
+-  }
+-}

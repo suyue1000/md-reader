@@ -1,6 +1,9 @@
 import type { MarkdownPlugin, PluginContext } from '@/types';
 import { highlightCode, resolveLanguage } from '@/markdown/highlighter';
+import { createLogger } from '@/utils/logger';
 import { yieldToMain } from '@/utils/scheduler';
+
+const log = createLogger('plugin:code-block');
 
 /** 超过这个行数才允许折叠，太短的代码块折叠反而碍事 */
 const COLLAPSE_THRESHOLD = 20;
@@ -39,8 +42,13 @@ const observed = new WeakSet<HTMLElement>();
 /** 待上色队列 */
 const queue = new Set<HTMLElement>();
 
-/** 队列是否正在推进 */
-let draining = false;
+/**
+ * 正在推进的那一轮队列；没在推进时为 null。
+ *
+ * 存 Promise 而不是布尔量，是为了让「一次做完」的调用方（导出的离屏渲染）
+ * 能等到队列真的排空。屏幕上的调用方照旧忽略返回值。
+ */
+let draining: Promise<void> | null = null;
 
 /**
  * 视口观察器。
@@ -94,7 +102,8 @@ function getObserver(scrollRoot: Element | null): IntersectionObserver | null {
           delete block.dataset[NEAR_VIEWPORT];
         }
       }
-      drainQueue();
+      // 滚动触发的推进没有人等它
+      void drainQueue();
     },
     { root: scrollRoot, rootMargin: PREHEAT_MARGIN },
   );
@@ -201,10 +210,13 @@ function rebuildActions(
   );
 
   if (collapsible) {
-    const toggle = createActionButton(block.classList.contains('is-collapsed') ? '展开' : '折叠', () => {
-      const collapsed = block.classList.toggle('is-collapsed');
-      toggle.textContent = collapsed ? '展开' : '折叠';
-    });
+    const toggle = createActionButton(
+      block.classList.contains('is-collapsed') ? '展开' : '折叠',
+      () => {
+        const collapsed = block.classList.toggle('is-collapsed');
+        toggle.textContent = collapsed ? '展开' : '折叠';
+      },
+    );
     actions.appendChild(toggle);
   }
 }
@@ -261,35 +273,83 @@ async function enhanceBlock(block: HTMLElement, ctx: PluginContext): Promise<voi
 }
 
 /**
- * 推进待处理队列：批内并发，批间让出主线程。
+ * 队列推进循环：批内并发，批间让出主线程。
+ *
+ * 不自己复位 `draining`——那件事交给 `drainQueue`，理由见那里。
+ */
+async function drainLoop(): Promise<void> {
+  while (queue.size > 0) {
+    const batch: HTMLElement[] = [];
+    for (const block of queue) {
+      batch.push(block);
+      queue.delete(block);
+      if (batch.length >= HIGHLIGHT_BATCH) break;
+    }
+
+    const ctx = currentContext;
+    if (!ctx) return;
+    /*
+     * allSettled 而不是 all：批里的块在上面已经从队列里摘掉了，没有人会再捡它们。
+     * 用 `Promise.all` 的话，一块失败就会让这一批剩下的结果**无人查看**——它们仍然
+     * 在跑，但成功与否没人知道，失败的那些从此消失得无声无息。逐条报出来，
+     * 至少「哪一块没上色」是可查的。
+     */
+    for (const [index, result] of (
+      await Promise.allSettled(batch.map((block) => enhanceBlock(block, ctx)))
+    ).entries()) {
+      if (result.status === 'rejected') {
+        log.warn(
+          `代码块上色失败（语言 ${batch[index]?.dataset['lang'] ?? '未知'}）`,
+          result.reason,
+        );
+      }
+    }
+    if (queue.size > 0) await yieldToMain();
+  }
+}
+
+/**
+ * 启动一轮推进；已经有一轮在跑就把它的 Promise 交出去。
  *
  * 同一时刻只允许一个推进循环。滚动会持续往队列里追加，若每次回调都
  * 开一个新循环，同一个块会被多个循环同时处理——而「已处理」标记要等
  * 异步完成后才写上，重复劳动拦不住。
+ *
+ * 复位 `draining` 与落定 `task` 排在同一条链上，次序是「先置 null、后落定」：
+ * 等在 task 上的人醒来时看到的一定是「没人在推进」。
+ *
+ * 复位必须走 `finally` 而不是 `then`：`then` 只在兑现时跑，一旦 `drainLoop`
+ * 以任何方式抛出（现在它自己兜住了每一批，但循环骨架本身仍可能出事），
+ * `draining` 就会**永久**停在一个已拒绝的 Promise 上，此后每一次
+ * `startDrain` 都直接把它交出去，整条队列再也推不动，而且不报错。
  */
-function drainQueue(): void {
-  if (draining || queue.size === 0) return;
-  draining = true;
+function startDrain(): Promise<void> {
+  if (draining) return draining;
+  if (queue.size === 0) return Promise.resolve();
 
-  void (async () => {
-    try {
-      while (queue.size > 0) {
-        const batch: HTMLElement[] = [];
-        for (const block of queue) {
-          batch.push(block);
-          queue.delete(block);
-          if (batch.length >= HIGHLIGHT_BATCH) break;
-        }
+  const task = drainLoop()
+    .catch((error: unknown) => {
+      log.warn('代码块上色队列意外终止', error);
+    })
+    .finally(() => {
+      draining = null;
+    });
+  draining = task;
+  return task;
+}
 
-        const ctx = currentContext;
-        if (!ctx) return;
-        await Promise.all(batch.map((block) => enhanceBlock(block, ctx)));
-        if (queue.size > 0) await yieldToMain();
-      }
-    } finally {
-      draining = false;
-    }
-  })();
+/**
+ * 推进待处理队列，返回的 Promise 在（调用时刻队列里的）块全部处理完后落定。
+ *
+ * 为什么在途时不能直接把那一轮的 Promise 交出去：上一轮可能**刚好**跑完了
+ * 最后一次 `queue.size > 0` 检查、正等着自己的复位回调，而我们的块是在那之后
+ * 才排进队列的。此时把它交出去，调用方会立刻醒来，而那批块一个都没处理——
+ * 导出拿到的就是一份没上色的代码。所以要先等它结束，再补启一轮。
+ * 只补一轮，不做无限重试：第二轮开始时 `draining` 必定已复位。
+ */
+function drainQueue(): Promise<void> {
+  if (draining) return draining.then(() => startDrain());
+  return startDrain();
 }
 
 /**
@@ -336,26 +396,53 @@ export const codeBlockPlugin: MarkdownPlugin = {
     };
   },
 
-  enhance: (root: HTMLElement, ctx: PluginContext) => {
+  enhance: async (root: HTMLElement, ctx: PluginContext) => {
     const blocks = root.querySelectorAll<HTMLElement>('.code-block');
     if (blocks.length === 0) return;
 
     // 供观察器回调使用；设置变化后回调要按新设置办事
     currentContext = ctx;
 
-    const scrollRoot = findScrollParent(root);
     const { reading } = ctx.settings;
     for (const block of blocks) {
       // 行号与换行是纯 CSS 行为，代价可忽略，所有块一律同步一次
       block.classList.toggle('is-numbered', reading.codeLineNumbers);
       block.classList.toggle('is-wrapped', reading.codeWordWrap);
+    }
 
+    /*
+     * 一次做完：整篇全排队、等排空，观察器一概不碰。
+     *
+     * 1. 离屏那棵树用完就丢，登记观察没有下一次回调可等，只会往一个全局
+     *    观察器上挂一批马上就要脱离文档的节点；
+     * 2. 更要紧的是它会白白扰动那个**全局**观察器：`getObserver` 在 root
+     *    变化时 `disconnect()` 重建（见上面那个函数），而离屏节点挂在 body 下，
+     *    `findScrollParent` 给出的 root 与屏幕上那棵树（滚动的是 AppShell 的
+     *    `<main>`）不是同一个。重建之后，已经进过 `observed` 这个 WeakSet 的
+     *    块不会再被登记一次，等于被永久摘掉了观察。
+     *
+     * 第 2 条的后果**实测下来是看不见的**，别把这条当成修了什么缺陷：
+     * 让 eager 也走一遍 `ensureObserved` 重新构建产物，导出后再往下滚，
+     * 四个位置的「挂载中的代码块 / 已上色」逐格等于不碰观察器时的结果
+     * （3/3、3/3、2/2、2/2）——因为每一轮 `enhance` 末尾的 `enqueueVisible`
+     * 本来就会把视口附近的块直接排进队列，新挂上来的块也会在重建后的观察器上
+     * 重新登记。这里躲开它只是不想在一个共享的全局对象上做无谓的拆建。
+     */
+    if (ctx.eager) {
+      for (const block of blocks) enqueue(block);
+      await drainQueue();
+      return;
+    }
+
+    const scrollRoot = findScrollParent(root);
+    for (const block of blocks) {
       // 已经在视口附近的块要立刻按新设置重做（换主题时正在看的那几块）
       if (block.dataset[NEAR_VIEWPORT] === '1') enqueue(block);
       ensureObserved(block, scrollRoot);
     }
 
     enqueueVisible(blocks, scrollRoot);
-    drainQueue();
+    // 屏幕上的增强不等队列排空：首屏结构已经在了，上色随后补上即可
+    void drainQueue();
   },
 };

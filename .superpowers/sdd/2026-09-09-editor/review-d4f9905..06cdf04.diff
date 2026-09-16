@@ -1,0 +1,1040 @@
+# Review package: d4f9905..HEAD
+
+## Commits
+06cdf04 修复正文锚点链接与锚点跳转的增强后落点校正
+
+## Files changed
+ src/hooks/usePendingAnchor.test.tsx | 155 +++++++++++++++++++-
+ src/hooks/usePendingAnchor.ts       | 143 ++++++++++++++++++-
+ src/hooks/useRelativeLinks.test.tsx | 273 ++++++++++++++++++++++++++++++++++++
+ src/hooks/useRelativeLinks.ts       | 132 +++++++++++++++--
+ src/markdown/toc.test.ts            |  30 +++-
+ src/markdown/toc.ts                 |  20 +++
+ src/viewer/pages/ReaderPage.tsx     |  23 ++-
+ 7 files changed, 745 insertions(+), 31 deletions(-)
+
+## Diff
+diff --git a/src/hooks/usePendingAnchor.test.tsx b/src/hooks/usePendingAnchor.test.tsx
+index b786d9b..d24813a 100644
+--- a/src/hooks/usePendingAnchor.test.tsx
++++ b/src/hooks/usePendingAnchor.test.tsx
+@@ -1,13 +1,14 @@
+-import { act, render } from '@testing-library/react';
++import { act, fireEvent, render, screen } from '@testing-library/react';
+ import type { EditorView } from '@codemirror/view';
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { ScrollContainerProvider } from '@/components/layout/ScrollContainerContext';
+ import { buildTocTree } from '@/markdown/toc';
+ import { useDocumentStore } from '@/stores/document.store';
+ import type { MarkdownDocument } from '@/types';
+ import { usePendingAnchor } from './usePendingAnchor';
+ 
+ /** 只替换 scrollToLine：跳没跳、跳到第几行，是这个 hook 的全部可观察行为 */
+ const scrollToLine = vi.fn();
+ vi.mock('@/editor/MarkdownEditor', () => ({
+   scrollToLine: (view: EditorView, line: number): void => {
+     scrollToLine(view, line);
+@@ -25,39 +26,70 @@ function doc(id: string): MarkdownDocument {
+     name: `${id}.md`,
+     path: `/${id}.md`,
+     content: '',
+     size: 0,
+     lastModified: 0,
+     source: 'url',
+   };
+ }
+ 
+ let view: EditorView | null;
++let container: HTMLElement;
+ 
+-function Probe(): null {
+-  usePendingAnchor(view);
+-  return null;
++/**
++ * `onEnhanced` 挂在按钮上再点，而不是把它赋给一个组件外的变量——渲染期给
++ * 外部变量赋值是 React 明令禁止的副作用（lint 也会拦），而「点一下代表这一轮
++ * 增强做完了」本来就更接近真实调用方的形态。
++ */
++function Probe(): React.JSX.Element {
++  const { onEnhanced } = usePendingAnchor(view);
++  return <button type="button" data-testid="enhanced" onClick={onEnhanced} />;
+ }
+ 
+ function mount(): { rerender: () => void } {
+-  const { rerender } = render(<Probe />);
+-  return { rerender: () => rerender(<Probe />) };
++  const tree = (): React.JSX.Element => (
++    <ScrollContainerProvider value={container}>
++      <Probe />
++    </ScrollContainerProvider>
++  );
++  const { rerender } = render(tree());
++  return { rerender: () => rerender(tree()) };
++}
++
++/** 触发一次「这一轮增强做完了」 */
++function enhance(): void {
++  fireEvent.click(screen.getByTestId('enhanced'));
++}
++
++/**
++ * 等一帧。
++ *
++ * 落点是在 rAF 里量的（CodeMirror 的滚动发生在下一帧的测量阶段），
++ * 不等这一帧，`expectedScrollTop` 还没被记下来，「用户滚走了没有」也就无从判起。
++ */
++async function nextFrame(): Promise<void> {
++  await act(async () => {
++    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
++  });
+ }
+ 
+ beforeEach(() => {
+   scrollToLine.mockClear();
+-  view = { dom: document.body } as unknown as EditorView;
++  container = document.createElement('div');
++  document.body.append(container);
++  view = { dom: container } as unknown as EditorView;
+   useDocumentStore.getState().reset();
+   useDocumentStore.getState().setPendingAnchor(null);
+ });
+ 
+ afterEach(() => {
++  container.remove();
+   useDocumentStore.getState().setPendingAnchor(null);
+ });
+ 
+ describe('usePendingAnchor', () => {
+   it('目录到齐后按行号跳转，并把锚点清掉', () => {
+     useDocumentStore.getState().setToc(TOC);
+     useDocumentStore.getState().setPendingAnchor('第二节');
+ 
+     mount();
+ 
+@@ -129,10 +161,119 @@ describe('setDocument 与待跳转锚点', () => {
+   });
+ 
+   it('带锚点打开的正常时序（先 setDocument 再 setPendingAnchor）不受影响', () => {
+     // useEmbeddedDocument 就是这个顺序，本次的锚点必须活下来
+     useDocumentStore.getState().setDocument(doc('某篇'));
+     useDocumentStore.getState().setPendingAnchor('某个标题');
+ 
+     expect(useDocumentStore.getState().pendingAnchor).toBe('某个标题');
+   });
+ });
++
++describe('增强完成后的落点校正', () => {
++  /** 带锚点打开一篇文档，并把首次跳转的落点量下来 */
++  async function openWithAnchor(): Promise<void> {
++    useDocumentStore.getState().setDocument(doc('带锚点的文档'));
++    useDocumentStore.getState().setToc(TOC);
++    useDocumentStore.getState().setPendingAnchor('第二节');
++    mount();
++    await nextFrame();
++    scrollToLine.mockClear();
++  }
++
++  it('增强完成后重新按锚点行号滚一次', async () => {
++    /*
++     * 缺口二。锚点跳转发生在 Shiki 上色 / Mermaid 出图**之前**，上方内容
++     * 随后被撑高，落点因此偏浅——实测同一目标，带锚点打开停在 scrollTop 5191
++     * （标题距容器顶 10.4px、侧栏高亮错一节），内容全部增强后走目录点击是
++     * 5199 / 6.8px。补这一次校正就是为了让两条路径落到同一处。
++     *
++     * 注意断言的是「又按同一个行号滚了一次」，不是「恢复了阅读位置」——
++     * 后者正是 useReadingPosition 的闩锁要挡住的事。
++     */
++    await openWithAnchor();
++
++    enhance();
++
++    expect(scrollToLine).toHaveBeenCalledWith(view, 37);
++  });
++
++  it('增强分好几轮结束时，每一轮都校正', async () => {
++    // Shiki 与 Mermaid 不在同一轮落定，视口变化还会再引发几轮
++    await openWithAnchor();
++
++    enhance();
++    await nextFrame();
++    enhance();
++
++    expect(scrollToLine).toHaveBeenCalledTimes(2);
++    expect(scrollToLine).toHaveBeenLastCalledWith(view, 37);
++  });
++
++  it('没有锚点打开的文档，增强完成后一动不动', async () => {
++    /*
++     * 反向对照。这条不成立的话，校正就变成了「所有文档都会在增强结束时被
++     * 拽到某一行」——比缺口二本身严重得多。
++     */
++    useDocumentStore.getState().setDocument(doc('普通文档'));
++    useDocumentStore.getState().setToc(TOC);
++    mount();
++    await nextFrame();
++
++    enhance();
++
++    expect(scrollToLine).not.toHaveBeenCalled();
++  });
++
++  it('用户已经自己滚走之后，不再把他拽回锚点', async () => {
++    /*
++     * `onEnhanced` 在每次视口变化之后都会触发，而用户滚动本身就会改变视口。
++     * 不撤防的话，用户每滚一下都被弹回锚点，文档等于滚不动了。
++     */
++    await openWithAnchor();
++
++    container.scrollTop = 1200;
++    enhance();
++
++    expect(scrollToLine).not.toHaveBeenCalled();
++  });
++
++  it('撤防之后不再恢复：滚回原处也不会又被校正一次', async () => {
++    await openWithAnchor();
++
++    container.scrollTop = 1200;
++    enhance();
++    container.scrollTop = 0;
++    enhance();
++
++    expect(scrollToLine).not.toHaveBeenCalled();
++  });
++
++  it('锚点指向不存在的标题时，增强完成后也不跳', async () => {
++    // 没跳成就没有落点，校正无处可校——尤其不能退回文档顶部
++    useDocumentStore.getState().setDocument(doc('锚点写错的文档'));
++    useDocumentStore.getState().setToc(TOC);
++    useDocumentStore.getState().setPendingAnchor('这个标题不存在');
++    mount();
++    await nextFrame();
++
++    enhance();
++
++    expect(scrollToLine).not.toHaveBeenCalled();
++  });
++
++  it('换文档之后，上一篇的锚点不会在新文档上被兑现', async () => {
++    /*
++     * 校正记的是行号，而行号只在它所属的那篇文档里有意义。不撤防的话，
++     * 切到一篇不带锚点的文档，它的第一次增强完成就会把用户拽到上一篇的
++     * 锚点行号上去。
++     */
++    await openWithAnchor();
++
++    act(() => {
++      useDocumentStore.getState().setDocument(doc('另一篇'));
++    });
++    enhance();
++
++    expect(scrollToLine).not.toHaveBeenCalled();
++  });
++});
+diff --git a/src/hooks/usePendingAnchor.ts b/src/hooks/usePendingAnchor.ts
+index 81680a0..f86a86c 100644
+--- a/src/hooks/usePendingAnchor.ts
++++ b/src/hooks/usePendingAnchor.ts
+@@ -1,58 +1,189 @@
+-import { useEffect } from 'react';
++import { useCallback, useEffect, useRef } from 'react';
+ import type { EditorView } from '@codemirror/view';
+ import { scrollToLine } from '@/editor/MarkdownEditor';
+-import { flattenToc } from '@/markdown/toc';
++import { useScrollContainer } from '@/components/layout/ScrollContainerContext';
++import { findHeadingLine } from '@/markdown/toc';
+ import { useDocumentStore } from '@/stores/document.store';
++import { isWithinScrollTolerance } from '@/utils/scroll-math';
++
++/**
++ * 判定「用户是不是自己滚走了」时允许的容差（像素）。
++ *
++ * 取值与 `useReadingPosition` 的 `SCROLL_TOLERANCE_PX` 同源：只吞次像素取整
++ * 这类「不算真的动了」的抖动，一次真实的滚动手势远大于它。
++ *
++ * 这里能用这么小的容差，是有实测依据的：带锚点打开后连续采样 6 秒，Shiki
++ * 从未上色到全部上色的整个过程里 `scrollTop` 一动没动（恒为 5191）。增强
++ * 造成的漂移发生在**文档坐标**里（上方内容变高，目标行整体下移），不体现
++ * 为 `scrollTop` 变化——这正是校正要修的东西，也正是它不会被误判成用户滚动
++ * 的原因。
++ */
++const ANCHOR_SCROLL_TOLERANCE_PX = 2;
++
++export interface UsePendingAnchorResult {
++  /**
++   * 供 `MarkdownEditor` 的 `onEnhanced` 调用：一轮增强（Shiki 上色、Mermaid
++   * 出图）结束后，重新按锚点行号滚一次。
++   *
++   * 与 `useReadingPosition` 的同名回调是**两件不同的事**，不要合并：这里做的
++   * 是「再按锚点滚一次」，那里做的是「恢复上次读到的位置」。带锚点打开的文档
++   * 只允许发生前者，见 `useReadingPosition` 里 `anchorDocRef` 闩锁的说明。
++   */
++  onEnhanced: () => void;
++}
+ 
+ /**
+  * 消费待跳转的标题锚点。
+  *
+  * 打开 `xxx.md#某标题` 时，锚点在地址里就位，而正文要等渲染完才存在——
+  * 浏览器原生的锚点跳转在文档还是一片空白时就已经执行过了，什么也找不到。
+  * 这个 hook 等到编辑器就绪再跳，并且只跳一次。
+  *
+  * 定位方式与目录跳转统一成行号：原先靠 `document.getElementById` 找标题
+  * 元素，而编辑器只渲染视口附近的块，锚点指向的标题十有八九不在 DOM 里，
+  * 于是查不到、跳不动——README 明确宣传的 `#锚点` 用法就是这么坏掉的。
+  * 改成从 store 的目录里按 id 查行号，再交给 `scrollToLine`。
+  *
+  * 跳转优先于阅读位置恢复：用户带着锚点打开一篇文档，意图是明确的，
+  * 不该被上次读到哪儿覆盖掉。调用顺序上本 hook 排在 `useReadingPosition`
+  * 之后，同一轮提交里后跑的 effect 说了算。
+  *
+  * @param view 编辑器实例；非空即表示首轮块渲染已完成（见 `onViewReady`），
+  *   此时 store 里的目录也已经是这篇文档的最终版本
+  */
+-export function usePendingAnchor(view: EditorView | null): void {
++export function usePendingAnchor(view: EditorView | null): UsePendingAnchorResult {
++  const container = useScrollContainer();
++  const documentId = useDocumentStore((state) => state.document?.id ?? '');
+   const pendingAnchor = useDocumentStore((state) => state.pendingAnchor);
+   const setPendingAnchor = useDocumentStore((state) => state.setPendingAnchor);
+   const toc = useDocumentStore((state) => state.toc);
+ 
++  /**
++   * 本篇文档的锚点最终落在哪一行；null 表示这篇文档不是带锚点打开的。
++   *
++   * 必须自己记下来，不能等到要校正时再读 `pendingAnchor`：那个字段是**消费
++   * 一次即清空**的，下面的 effect 滚完就把它置回 null 了，而增强要等几百毫秒
++   * 到几秒才结束。这与 `useReadingPosition` 里闩锁存在的理由完全一致。
++   */
++  const anchorLineRef = useRef<number | null>(null);
++  /**
++   * 我们自己最后一次滚动落定后的 `scrollTop`，用来在校正前甄别「用户是不是
++   * 已经自己滚走了」。null 表示还没测到（容器缺席，或 rAF 还没跑）。
++   */
++  const expectedScrollTopRef = useRef<number | null>(null);
++  /** 用来测落点的那个 rAF，卸载时要能取消 */
++  const measureFrameRef = useRef(0);
++
++  /*
++   * 换文档时撤防。
++   *
++   * 声明在下面消费 effect **之前**，保证同一轮提交里先撤防、后置位——否则
++   * 「带锚点换文档」的那一轮会把刚记下的行号又抹掉。
++   *
++   * 记的是「上一篇的锚点不该影响下一篇」这件事：不撤防的话，切到一篇没有
++   * 锚点的文档后，它的第一次增强完成会把用户拽到上一篇文档的锚点行号上去。
++   */
++  useEffect(() => {
++    anchorLineRef.current = null;
++    expectedScrollTopRef.current = null;
++  }, [documentId]);
++
++  /**
++   * 滚到锚点行，并记下落定后的 `scrollTop`。
++   *
++   * 测量排到 rAF 里而不是紧跟着读：`scrollToLine` 派发的是 CodeMirror 的
++   * `scrollIntoView` 效果，真正的滚动发生在下一帧的测量阶段（见
++   * `EditorView.measure`），当场读到的还是滚动前的值，拿它做基准会让紧接着
++   * 的第一次校正被误判成「用户滚走了」。
++   */
++  const scrollToAnchor = useCallback(
++    (targetView: EditorView, line: number): void => {
++      scrollToLine(targetView, line);
++      if (!container) return;
++
++      if (measureFrameRef.current !== 0) cancelAnimationFrame(measureFrameRef.current);
++      measureFrameRef.current = requestAnimationFrame(() => {
++        measureFrameRef.current = 0;
++        expectedScrollTopRef.current = container.scrollTop;
++      });
++    },
++    [container],
++  );
++
+   useEffect(() => {
+     /*
+      * 空目录时必须**什么都不做**，尤其不能顺手把锚点清掉。
+      *
+      * 换文档的那一轮提交里，`view` 还指着上一篇文档的编辑器实例——子组件
+      * 的 effect 先于父组件跑，`MarkdownEditor` 虽然已经在重建并回调了
+      * `onViewReady(null)`，但那是一次 state 更新，本轮 effect 读到的仍是
+      * 旧值。只看 `view` 非空就动手，锚点会在新文档还没渲染时就被当成
+      * 「找不到」清掉——实测正是这样跳不过去的。
+      *
+      * `toc` 非空是可靠的门槛：`setDocument` 会把它清空，只有新编辑器跑完
+      * 首轮块渲染、把标题送进 store 之后才会再次非空，而那必然发生在
+      * `onViewReady` 之前（见 `MarkdownEditor` 里 rerender 与 notifyViewReady
+      * 的顺序）。
+      *
+      * 代价是「文档里一个标题都没有」时锚点不会被清掉。这没有后果：本来也
+      * 无处可跳，而残留会在下一次 `setDocument` 时清干净。
+      */
+     if (!view || pendingAnchor === null || toc.length === 0) return;
+ 
+-    const target = flattenToc(toc).find((node) => node.id === pendingAnchor);
+-    if (target) scrollToLine(view, target.line);
++    const line = findHeadingLine(toc, pendingAnchor);
++    if (line !== null) {
++      // 记下来供增强完成后的校正复用，见 anchorLineRef
++      anchorLineRef.current = line;
++      scrollToAnchor(view, line);
++    }
+ 
+     // 找不到也要清掉：锚点可能指向一个已经不存在的标题，
+     // 留着会让之后每一轮块渲染都白试一遍
+     setPendingAnchor(null);
+-  }, [view, pendingAnchor, toc, setPendingAnchor]);
++  }, [view, pendingAnchor, toc, setPendingAnchor, scrollToAnchor]);
++
++  /**
++   * 增强完成后重新按锚点行号滚一次。
++   *
++   * 为什么需要：锚点跳转发生在 Shiki 上色 / Mermaid 出图**之前**，此时上方
++   * 内容还没被撑到最终高度，算出来的像素落点偏浅。实测对照（同一文档同一
++   * 目标）：带锚点打开落在 `scrollTop 5191`、标题距容器顶 10.4px，侧栏高亮
++   * 指到了上一章；内容全部增强后走目录点击是 5199 / 6.8px、高亮正确。用户
++   * 小幅滚动**不会**自愈——高亮忠实反映了视口的真实位置，是落点本身短了。
++   *
++   * 为什么是「重新滚一次」而不是「恢复阅读位置」：这两条路径在带锚点的文档上
++   * 是互斥的。`useReadingPosition` 的 `anchorDocRef` 闩锁专门挡住后者，正是
++   * 为了不让「上次读到的位置」覆盖用户显式指定的锚点。本回调只认
++   * `anchorLineRef`，既不读也不写阅读位置，闩锁因此完全不受影响。
++   *
++   * 用户已经自己滚走时必须放弃：`onEnhanced` 在每次视口变化后都会触发
++   * （见 `MarkdownEditor` 里 `enhanceMounted` 的调用点），不撤防的话用户
++   * 每滚一下都会被弹回锚点，文档等于滚不动了。撤防之后不再恢复——同一篇
++   * 文档里锚点只兑现这一次。
++   */
++  const onEnhanced = useCallback((): void => {
++    const line = anchorLineRef.current;
++    if (line === null || !view) return;
++
++    const expected = expectedScrollTopRef.current;
++    if (
++      container &&
++      expected !== null &&
++      !isWithinScrollTolerance(container.scrollTop, expected, ANCHOR_SCROLL_TOLERANCE_PX)
++    ) {
++      anchorLineRef.current = null;
++      return;
++    }
++
++    scrollToAnchor(view, line);
++  }, [view, container, scrollToAnchor]);
++
++  // 卸载时别留下悬挂的 rAF
++  useEffect(() => {
++    return () => {
++      if (measureFrameRef.current !== 0) cancelAnimationFrame(measureFrameRef.current);
++    };
++  }, []);
++
++  return { onEnhanced };
+ }
+diff --git a/src/hooks/useRelativeLinks.test.tsx b/src/hooks/useRelativeLinks.test.tsx
+new file mode 100644
+index 0000000..f3b66c5
+--- /dev/null
++++ b/src/hooks/useRelativeLinks.test.tsx
+@@ -0,0 +1,273 @@
++import { act, render } from '@testing-library/react';
++import type { EditorView } from '@codemirror/view';
++import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
++import { ScrollContainerProvider } from '@/components/layout/ScrollContainerContext';
++import { buildTocTree } from '@/markdown/toc';
++import { useDocumentStore } from '@/stores/document.store';
++import { useWorkspaceStore } from '@/stores/workspace.store';
++import type { MarkdownDocument } from '@/types';
++import type * as FileOpen from '@/utils/file-open';
++import { useRelativeLinks } from './useRelativeLinks';
++
++/** 只替换 scrollToLine：跳没跳、跳到第几行，是锚点这条路径的全部可观察行为 */
++const scrollToLine = vi.fn();
++vi.mock('@/editor/MarkdownEditor', () => ({
++  scrollToLine: (view: EditorView, line: number): void => {
++    scrollToLine(view, line);
++  },
++}));
++
++/**
++ * 工作区整个换成替身。
++ *
++ * 真实的 `openPath` 会去读文件、写 store、登记句柄，而本文件要验证的只是
++ * 「这次点击有没有被交给它」。
++ */
++const openPath = vi.fn();
++vi.mock('./useWorkspace', () => ({
++  useWorkspace: () => ({
++    openPath,
++    openFolder: vi.fn(),
++    restoreFolder: vi.fn(),
++    closeFolder: vi.fn(),
++  }),
++}));
++
++/** 相对链接分支要问「这个路径在工作区里吗」，只放行我们准备好的那一个 */
++vi.mock('@/utils/file-open', async (importOriginal) => ({
++  ...(await importOriginal<typeof FileOpen>()),
++  getFileHandleByPath: (path: string): unknown =>
++    path === 'docs/install.md' ? { kind: 'file' } : undefined,
++}));
++
++const TOC = buildTocTree([
++  { id: '开篇', text: '开篇', level: 1, line: 0 },
++  { id: '第二节', text: '第二节', level: 2, line: 37 },
++  { id: '第二节-1', text: '第二节', level: 3, line: 96 },
++]);
++
++function doc(path: string): MarkdownDocument {
++  return {
++    id: path,
++    name: 'readme.md',
++    path,
++    content: '',
++    size: 0,
++    lastModified: 0,
++    source: 'url',
++  };
++}
++
++let container: HTMLElement;
++let view: EditorView | null;
++/** 拦下 log.warn，避免「找不到锚点」那一条刷进测试输出 */
++let warn: MockInstance<typeof console.warn>;
++
++function Probe(): null {
++  useRelativeLinks(view);
++  return null;
++}
++
++function mount(): void {
++  render(
++    <ScrollContainerProvider value={container}>
++      <Probe />
++    </ScrollContainerProvider>,
++  );
++}
++
++/** 在正文容器里放一个链接并点它 */
++function clickLink(href: string, init: MouseEventInit = {}): { defaultPrevented: boolean } {
++  const link = document.createElement('a');
++  link.setAttribute('href', href);
++  link.textContent = '去那一节';
++  container.append(link);
++
++  /*
++   * 在 document 上补一道兜底：被测 hook 放行的点击会一路冒泡到 jsdom 的
++   * 链接默认行为，而 jsdom 没有实现导航，会往测试输出里吐一大段
++   * 「Not implemented: navigation」。这道监听器排在容器监听器之后（冒泡到
++   * document 才轮到它），先如实记下此刻的 defaultPrevented——那正是被测
++   * 代码的判定结果——再把默认行为拦掉。
++   */
++  const observed = { defaultPrevented: false };
++  const guard = (event: Event): void => {
++    observed.defaultPrevented = event.defaultPrevented;
++    event.preventDefault();
++  };
++  document.addEventListener('click', guard);
++  link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, button: 0, ...init }));
++  document.removeEventListener('click', guard);
++
++  return observed;
++}
++
++beforeEach(() => {
++  scrollToLine.mockClear();
++  openPath.mockClear();
++  warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
++
++  container = document.createElement('div');
++  document.body.append(container);
++  // hook 只把 view 当作 scrollToLine 的实参传出去，这里不需要真的编辑器
++  view = { dom: container } as unknown as EditorView;
++
++  useDocumentStore.getState().reset();
++  useWorkspaceStore.getState().clearWorkspace();
++});
++
++afterEach(() => {
++  container.remove();
++  warn.mockRestore();
++});
++
++describe('正文里的站内锚点链接', () => {
++  it('目标标题不在 DOM 里也能跳——按目录里的行号滚过去', () => {
++    /*
++     * 缺口一的核心。虚拟化之后视口外的标题根本不在 DOM 里，交给浏览器原生
++     * 处理的话点击**毫无反应**。这里刻意不往 DOM 里放任何 id 为「第二节」
++     * 的元素，模拟的就是这个场景。
++     */
++    useDocumentStore.getState().setToc(TOC);
++    mount();
++
++    const { defaultPrevented } = clickLink('#第二节');
++
++    expect(scrollToLine).toHaveBeenCalledWith(view, 37);
++    expect(defaultPrevented).toBe(true);
++  });
++
++  it('百分号编码的中文锚点同样命中', () => {
++    // markdown-it 渲染出来的 href 是编码过的，目录里的 id 是原文
++    useDocumentStore.getState().setToc(TOC);
++    mount();
++
++    clickLink(`#${encodeURIComponent('第二节')}`);
++
++    expect(scrollToLine).toHaveBeenCalledWith(view, 37);
++  });
++
++  it('重复标题的去重后缀不会被当成另一个标题', () => {
++    useDocumentStore.getState().setToc(TOC);
++    mount();
++
++    clickLink('#第二节-1');
++
++    expect(scrollToLine).toHaveBeenCalledWith(view, 96);
++  });
++
++  it('没打开文件夹时照样能跳', () => {
++    /*
++     * 单独打开一个 .md 文件是最常见的用法，此时 rootName 为 null。
++     * 原实现把「打开过文件夹」当成整个监听器的前提，锚点会一起被挡掉。
++     */
++    useDocumentStore.getState().setToc(TOC);
++    expect(useWorkspaceStore.getState().rootName).toBeNull();
++    mount();
++
++    clickLink('#第二节');
++
++    expect(scrollToLine).toHaveBeenCalledWith(view, 37);
++  });
++
++  it('目标不是标题、但就在 DOM 里时放行给浏览器', () => {
++    // 脚注引用（#fn1）走的就是这条路，浏览器自己跳得了，不该抢
++    const footnote = document.createElement('li');
++    footnote.id = 'fn1';
++    container.append(footnote);
++    useDocumentStore.getState().setToc(TOC);
++    mount();
++
++    const { defaultPrevented } = clickLink('#fn1');
++
++    expect(scrollToLine).not.toHaveBeenCalled();
++    expect(defaultPrevented).toBe(false);
++  });
++
++  it('目录与页面里都不存在的锚点：原地不动，并且不静默', () => {
++    // 有意选择：既不放行（会改地址栏 hash 却跳不动），也不兜底跳文档顶部
++    useDocumentStore.getState().setToc(TOC);
++    mount();
++
++    const { defaultPrevented } = clickLink('#根本没有这一节');
++
++    expect(scrollToLine).not.toHaveBeenCalled();
++    expect(defaultPrevented).toBe(true);
++    expect(warn).toHaveBeenCalled();
++  });
++
++  it('编辑器未就绪时放行，不吞掉这次点击', () => {
++    view = null;
++    useDocumentStore.getState().setToc(TOC);
++    mount();
++
++    const { defaultPrevented } = clickLink('#第二节');
++
++    expect(scrollToLine).not.toHaveBeenCalled();
++    expect(defaultPrevented).toBe(false);
++  });
++
++  it('按住修饰键点击不拦截', () => {
++    useDocumentStore.getState().setToc(TOC);
++    mount();
++
++    const { defaultPrevented } = clickLink('#第二节', { metaKey: true });
++
++    expect(scrollToLine).not.toHaveBeenCalled();
++    expect(defaultPrevented).toBe(false);
++  });
++
++  it('目录随后到齐（编辑器又渲染了一轮）时用的是新目录', () => {
++    // 目录走 ref 而不是 effect 依赖，这条锁住 ref 确实被同步了
++    mount();
++    clickLink('#第二节');
++    expect(scrollToLine).not.toHaveBeenCalled();
++
++    act(() => {
++      useDocumentStore.getState().setToc(TOC);
++    });
++    clickLink('#第二节');
++
++    expect(scrollToLine).toHaveBeenCalledWith(view, 37);
++  });
++});
++
++describe('工作区相对链接（回归）', () => {
++  beforeEach(() => {
++    useDocumentStore.getState().setDocument(doc('docs/readme.md'));
++    useWorkspaceStore.getState().setWorkspace({
++      rootName: 'docs',
++      tree: [],
++      fileCount: 1,
++      truncated: false,
++      paths: ['docs/install.md'],
++    });
++  });
++
++  it('工作区内的相对链接仍然由阅读器打开', () => {
++    mount();
++
++    const { defaultPrevented } = clickLink('./install.md');
++
++    expect(openPath).toHaveBeenCalledWith('docs/install.md');
++    expect(defaultPrevented).toBe(true);
++  });
++
++  it('不在工作区里的相对链接保持默认行为', () => {
++    mount();
++
++    const { defaultPrevented } = clickLink('./missing.md');
++
++    expect(openPath).not.toHaveBeenCalled();
++    expect(defaultPrevented).toBe(false);
++  });
++
++  it('绝对链接保持默认行为', () => {
++    mount();
++
++    const { defaultPrevented } = clickLink('https://example.com/a.md');
++
++    expect(openPath).not.toHaveBeenCalled();
++    expect(defaultPrevented).toBe(false);
++  });
++});
+diff --git a/src/hooks/useRelativeLinks.ts b/src/hooks/useRelativeLinks.ts
+index da2c157..aab8155 100644
+--- a/src/hooks/useRelativeLinks.ts
++++ b/src/hooks/useRelativeLinks.ts
+@@ -1,55 +1,161 @@
+-import { useEffect } from 'react';
++import { useEffect, useRef } from 'react';
++import type { EditorView } from '@codemirror/view';
++import { scrollToLine } from '@/editor/MarkdownEditor';
+ import { useScrollContainer } from '@/components/layout/ScrollContainerContext';
++import { findHeadingLine } from '@/markdown/toc';
+ import { useDocumentStore } from '@/stores/document.store';
+ import { useWorkspaceStore } from '@/stores/workspace.store';
++import type { TocNode } from '@/types';
+ import { resolveRelativePath } from '@/utils/directory';
+ import { getFileHandleByPath } from '@/utils/file-open';
++import { createLogger } from '@/utils/logger';
+ import { useWorkspace } from './useWorkspace';
+ 
++const log = createLogger('relative-links');
++
+ /**
+- * 文档内相对链接的跳转。
++ * 把 `href` 里的片段还原成锚点 id。
++ *
++ * markdown-it 渲染链接时会对 URL 做百分号编码，`[见下文](#一、简介)` 到了 DOM
++ * 属性上是 `#%E4%B8%80%E3%80%81%E7%AE%80%E4%BB%8B`，而目录里存的 id 是解码后
++ * 的原文——不解码就永远对不上，中文标题的锚点会全部失效。`useEmbeddedDocument`
++ * 处理地址栏锚点时做的是同一步。
++ *
++ * 解码失败（半截的百分号转义）时退回原文而不是让异常冒出去：一个坏链接不该
++ * 把整个点击处理连同后面的相对链接一起打掉。
++ */
++function decodeFragment(href: string): string {
++  const raw = href.slice(1);
++  try {
++    return decodeURIComponent(raw);
++  } catch {
++    return raw;
++  }
++}
++
++/**
++ * 文档内链接的跳转：站内锚点与工作区相对路径。
++ *
++ * 两类链接合在一个监听器里，是因为它们的入口是同一个——正文里的一次点击，
++ * 拆成两个 hook 就要在同一个容器上装两个监听器，还得各自重复一遍
++ * 「修饰键 / 中键 / defaultPrevented」这套放行判断。
++ *
++ * ## 站内锚点 `[文字](#某标题)`
++ *
++ * 手写目录、「见下文的 xxx 一节」这类交叉引用在 Markdown 里极常见。虚拟化
++ * 之前这类链接交给浏览器原生处理就行——所有标题都在 DOM 里，浏览器自己能跳。
++ * 现在编辑器只渲染视口附近的块，视口外的标题根本不在 DOM 里，浏览器找不到
++ * 目标，点击**毫无反应**。所以要拦下来，走与地址栏锚点完全相同的机制：
++ * 按 id 在目录里查行号（`findHeadingLine`），再 `scrollToLine`。
++ *
++ * ## 工作区相对链接 `[安装](./install.md)`
+  *
+- * 打开文件夹后，`[安装](./install.md)` 这类链接应该在阅读器里直接打开，
+- * 而不是让浏览器去请求一个不存在的 `chrome-extension://...install.md`。
++ * 打开文件夹后这类链接应该在阅读器里直接打开，而不是让浏览器去请求一个
++ * 不存在的 `chrome-extension://...install.md`。
+  *
+  * 实现要点：
+- * 1. **事件委托**：监听正文容器而不是给每个 `<a>` 挂监听——正文是
+- *    innerHTML 渲染的，每次刷新都会换一批节点，逐个绑定既慢又容易泄漏；
+- * 2. **只拦截能处理的**：外链、锚点、以及不在工作区里的相对链接一律放行，
+- *    保持浏览器的默认行为（新窗口打开 / 滚动到锚点）；
++ * 1. **事件委托**：监听正文容器而不是给每个 `<a>` 挂监听——正文块是按视口
++ *    动态挂载/销毁的，逐个绑定既慢又必然泄漏；
++ * 2. **只拦截能处理的**：外链、以及不在工作区里的相对链接一律放行，
++ *    保持浏览器的默认行为（新窗口打开）；
+  * 3. **尊重修饰键**：按住 Ctrl/Cmd 或中键点击时不拦截，让用户仍能
+  *    「在新标签页打开」。
++ *
++ * @param view 编辑器实例；未就绪时为 null，此时锚点跳转不介入
+  */
+-export function useRelativeLinks(): void {
++export function useRelativeLinks(view: EditorView | null): void {
+   const container = useScrollContainer();
+   const currentPath = useDocumentStore((state) => state.document?.path ?? '');
++  const toc = useDocumentStore((state) => state.toc);
+   const rootName = useWorkspaceStore((state) => state.rootName);
+   const { openPath } = useWorkspace();
+ 
++  /**
++   * 目录与编辑器实例走 ref 而不是 effect 依赖。
++   *
++   * 两者都会频繁换新——每渲染一轮块就是一棵新的目录树，编辑期每 200ms 一次。
++   * 放进依赖数组会让这个点击监听器被反复拆装，而它是纯粹的事件委托，
++   * 拆装一次不带来任何正确性，只是白干活。点击发生时现读 ref 拿到的必然是
++   * 最新值。
++   */
++  const latestRef = useRef<{ toc: readonly TocNode[]; view: EditorView | null }>({ toc, view });
++  // 同步写在 effect 里而不是渲染期：渲染期改 ref 是 React 明令禁止的副作用
++  // （lint 也会拦）。点击一定发生在提交之后，读到的必然是最新值
++  useEffect(() => {
++    latestRef.current = { toc, view };
++  }, [toc, view]);
++
+   useEffect(() => {
+-    // 没打开文件夹时没有可跳转的目标，直接不拦截
+-    if (!container || rootName === null || currentPath === '') return;
++    if (!container) return;
++
++    /** 站内锚点 `#xxx` 的处理 */
++    const handleAnchor = (event: MouseEvent, href: string): void => {
++      const id = decodeFragment(href);
++      const { toc: currentToc, view: currentView } = latestRef.current;
++
++      const line = findHeadingLine(currentToc, id);
++      if (line !== null) {
++        // 编辑器还没就绪时放行：此刻正文也还没渲染出来，没有可跳的落点，
++        // 交给浏览器至少不会比我们做得更差
++        if (!currentView) return;
++        event.preventDefault();
++        scrollToLine(currentView, line);
++        return;
++      }
++
++      /*
++       * 不是标题——脚注引用（`#fn1`）、正文里手写的 `<a id>` 都属于这一类。
++       * 目标就在 DOM 里的话浏览器自己能跳，别抢：这条路径在虚拟化之前就是
++       * 好的，抢过来反而要重新实现一遍「元素滚动到视口」。
++       */
++      if (document.getElementById(id)) return;
++
++      /*
++       * 既不是标题、目标也不在 DOM 里：**保持原地不动**，这是有意选择。
++       *
++       * 另外两种可能的行为都更差：放行会让浏览器把地址栏 hash 改成一个跳不到
++       * 的片段（页面不动，但后退键的行为变得莫名其妙），而「兜底跳文档顶部」
++       * 会把用户从正在读的地方一把甩走——一次误跳比没跳难恢复得多。
++       *
++       * 但不静默：打一条 warn。锚点失效通常是文档自己写错了（标题改过、
++       * 手写的锚点和 slug 规则对不上），用户和文档作者都需要知道。
++       */
++      event.preventDefault();
++      log.warn('锚点在目录与页面里都不存在，已保持原位', id);
++    };
+ 
+     const handleClick = (event: MouseEvent): void => {
+       if (event.defaultPrevented) return;
+       // 修饰键点击 = 用户想在新标签页打开，别抢
+       if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+       if (event.button !== 0) return;
+ 
+       const anchor = (event.target as Element | null)?.closest('a');
+       if (!anchor) return;
+ 
+       const href = anchor.getAttribute('href');
+       if (!href) return;
+-      // 站内锚点与绝对链接交给浏览器
+-      if (href.startsWith('#') || /^[a-z][a-z0-9+.-]*:/i.test(href)) return;
++
++      if (href.startsWith('#')) {
++        handleAnchor(event, href);
++        return;
++      }
++      // 绝对链接交给浏览器
++      if (/^[a-z][a-z0-9+.-]*:/i.test(href)) return;
++
++      /*
++       * 以下是相对路径分支，它需要「打开过文件夹」这个前提；锚点分支不需要，
++       * 所以这道门槛留在这里而不是提到 effect 顶上——提上去会让没打开文件夹时
++       * 连锚点都跳不了，而单独打开一个 .md 文件是最常见的用法。
++       */
++      if (rootName === null || currentPath === '') return;
+ 
+       const resolved = resolveRelativePath(currentPath, href);
+       // 解析不出来或不在工作区里，保持默认行为
+       if (!resolved || !getFileHandleByPath(resolved)) return;
+ 
+       event.preventDefault();
+       void openPath(resolved);
+     };
+ 
+     container.addEventListener('click', handleClick);
+diff --git a/src/markdown/toc.test.ts b/src/markdown/toc.test.ts
+index 3684f5f..ce8ed3f 100644
+--- a/src/markdown/toc.test.ts
++++ b/src/markdown/toc.test.ts
+@@ -1,12 +1,12 @@
+ import { describe, expect, it } from 'vitest';
+-import { activeHeadingAt, buildTocTree, filterToc, flattenToc } from './toc';
++import { activeHeadingAt, buildTocTree, filterToc, findHeadingLine, flattenToc } from './toc';
+ 
+ describe('buildTocTree', () => {
+   it('按层级嵌套标题', () => {
+     const tree = buildTocTree([
+       { id: 'a', text: 'A', level: 1, line: 0 },
+       { id: 'a1', text: 'A1', level: 2, line: 2 },
+       { id: 'a2', text: 'A2', level: 2, line: 4 },
+       { id: 'b', text: 'B', level: 1, line: 6 },
+     ]);
+ 
+@@ -162,10 +162,38 @@ describe('activeHeadingAt', () => {
+   it('目标落在第一个标题之前时返回 null', () => {
+     // 文档以正文开头的情况，调用方自己决定要不要退回第一个标题
+     expect(activeHeadingAt(flat, 0)).toBeNull();
+     expect(activeHeadingAt(flat, 2)).toBeNull();
+   });
+ 
+   it('空目录返回 null', () => {
+     expect(activeHeadingAt([], 0)).toBeNull();
+   });
+ });
++
++describe('findHeadingLine', () => {
++  /** 树形结构：深层标题必须能被找到，只看顶层会漏掉除 h1 之外的全部标题 */
++  const tree = buildTocTree([
++    { id: '开篇', text: '开篇', level: 1, line: 0 },
++    { id: '安装', text: '安装', level: 2, line: 12 },
++    { id: '常见问题', text: '常见问题', level: 3, line: 48 },
++    { id: '常见问题-1', text: '常见问题', level: 3, line: 90 },
++  ]);
++
++  it('命中深层子节点', () => {
++    expect(findHeadingLine(tree, '常见问题')).toBe(48);
++  });
++
++  it('去重后缀是另一个标题，不会串到原标题上', () => {
++    expect(findHeadingLine(tree, '常见问题-1')).toBe(90);
++  });
++
++  it('文档第一行的标题返回 0 而不是 null', () => {
++    // 0 是合法行号；用 0 表示「没找到」会让「跳到开篇」和「跳不动」混为一谈
++    expect(findHeadingLine(tree, '开篇')).toBe(0);
++  });
++
++  it('找不到时返回 null', () => {
++    expect(findHeadingLine(tree, '不存在的锚点')).toBeNull();
++    expect(findHeadingLine([], '开篇')).toBeNull();
++  });
++});
+diff --git a/src/markdown/toc.ts b/src/markdown/toc.ts
+index 27e69c2..52631c4 100644
+--- a/src/markdown/toc.ts
++++ b/src/markdown/toc.ts
+@@ -191,10 +191,30 @@ export function activeHeadingAt(flat: readonly TocNode[], line: number): TocNode
+     if (node.line <= line) {
+       found = node;
+       low = mid + 1;
+     } else {
+       high = mid - 1;
+     }
+   }
+ 
+   return found;
+ }
++
++/**
++ * 按锚点 id 在目录树里找到对应标题的行号。
++ *
++ * 抽成共用函数而不是让调用方各写一遍：「按 id 找行号」现在有两个调用方——
++ * 地址栏锚点（`usePendingAnchor`）与正文里的 `[文字](#标题)` 链接
++ * （`useRelativeLinks`）。两份实现迟早会在某个边界上分岔（大小写、去重后缀、
++ * URL 解码），而分岔的表现是「同一个锚点从地址栏能跳、从正文点不动」，
++ * 极难查。这与 `LineHeading` / `FlatHeading` 收敛成一份是同一个理由。
++ *
++ * 必须遍历整棵树：`TocNode` 是有 `children` 的树，只看顶层会漏掉除 h1 之外的
++ * 全部标题。
++ *
++ * @returns 命中标题的 0-based 行号；目录里没有这个 id 时为 null。
++ *   刻意用 null 而不是 -1 或 0——行号 0（文档第一行）本身就是个合法的跳转目标，
++ *   用 0 表示「没找到」会让「跳到开篇」和「跳不动」变成同一件事。
++ */
++export function findHeadingLine(nodes: readonly TocNode[], id: string): number | null {
++  return flattenToc(nodes).find((node) => node.id === id)?.line ?? null;
++}
+diff --git a/src/viewer/pages/ReaderPage.tsx b/src/viewer/pages/ReaderPage.tsx
+index 9c6ea5b..2f4cf65 100644
+--- a/src/viewer/pages/ReaderPage.tsx
++++ b/src/viewer/pages/ReaderPage.tsx
+@@ -79,33 +79,48 @@ export function ReaderPage(): React.JSX.Element {
+   const handleHeadings = useCallback(
+     (headings: readonly FlatHeading[]) => {
+       setToc(buildTocTree(headings));
+     },
+     [setToc],
+   );
+ 
+   // 目录高亮跟随滚动；放在这里是因为它需要 AppShell 提供的滚动容器上下文
+   useScrollSpy(view);
+   useAutoRefresh();
+-  const { onEnhanced } = useReadingPosition({ documentId, view });
++  const { onEnhanced: restoreAfterEnhance } = useReadingPosition({ documentId, view });
+   // 放在阅读位置恢复之后：带锚点打开时，锚点说了算
+-  usePendingAnchor(view);
+-  useRelativeLinks();
++  const { onEnhanced: reanchorAfterEnhance } = usePendingAnchor(view);
++  useRelativeLinks(view);
++
++  /**
++   * 「一轮增强做完了」这个信号有两个消费方，在这里合并。
++   *
++   * 两者在同一篇文档上是互斥的：带锚点打开时阅读位置恢复被
++   * `useReadingPosition` 的闩锁整个挡住（不恢复，也不校正），没有锚点时
++   * `usePendingAnchor` 手里没有行号，什么都不做。
++   *
++   * 顺序仍然按「锚点在后」排，与上面 hook 的调用顺序保持一致：万一将来哪次
++   * 改动让闩锁漏了一次，后跑的锚点校正还能把落点纠回来，而不是反过来。
++   */
++  const handleEnhanced = useCallback(() => {
++    restoreAfterEnhance();
++    reanchorAfterEnhance();
++  }, [restoreAfterEnhance, reanchorAfterEnhance]);
+ 
+   if (status === 'error' && storeError) return <ErrorState message={storeError} />;
+   if (!doc) return <EmptyState />;
+ 
+   return (
+     // 版心与内边距由 editorTheme 的 .cm-content 负责，这里再套一层会叠加两层版心
+     <article className="app-article">
+       <MarkdownEditor
+         value={doc.content}
+         documentId={doc.id}
+         baseUrl={doc.baseUrl}
+         readOnly
+         onHeadings={handleHeadings}
+         onViewReady={setView}
+-        onEnhanced={onEnhanced}
++        onEnhanced={handleEnhanced}
+       />
+     </article>
+   );
+ }

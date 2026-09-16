@@ -1,11 +1,27 @@
 /**
- * Markdown 渲染管线的对外契约（Phase 2 实现）。
+ * Markdown 渲染管线的对外契约。
  *
- * 提前定义接口的目的：viewer / TOC / 搜索 / 导出 四个模块都依赖渲染结果，
- * 先把「输入什么、产出什么」钉死，各模块可以并行开发而不必等渲染器落地。
+ * 渲染结果如今有两类消费者，形态完全不同，接口因此也分成两半：
+ * - **块渲染**（`editor/block-render.ts`）拿 `instance()` 自己掌控 parse 与
+ *   render 的时机——同一个 env 贯穿全篇、逐块出 HTML，屏幕上看到的正文走这条；
+ * - **离屏渲染**（`editor/offscreen-render.ts`，服务于导出与打印）拿 `render()`
+ *   一次成型，要的是「整篇的 HTML」这一个结果。
+ *
+ * ## 关于 `RenderResult.toc`
+ *
+ * **屏幕上的目录不走这里**：它由块渲染在 parse 的同一趟里抽出扁平标题
+ * （`BlockRenderResult.headings`），再由 `ReaderPage` 折成树塞进 store，
+ * 与正文共用一次解析。
+ *
+ * `render()` 仍然产出 `toc`，但**当前没有生产代码消费它**——唯一的调用方
+ * `renderOffscreen` 只取 `html`。留着不删有两个理由，都不是「将来可能用得上」：
+ * 一是它是这条 API 的完整性所在（一次成型的整篇渲染，理应连同整篇的目录一起给，
+ * 而 token 已经在手，代价只是多扫一遍）；二是「锚点 id 与目录 id 必须一致」
+ * 这条跨模块约束目前只有走 `render()` 的用例在锁（见 renderer.test.ts）。
+ * 如果哪天要动它，请连同这两点一起考虑，不要只看「没人调用」。
  */
+import type MarkdownIt from 'markdown-it';
 import type { Settings, TocNode } from '@/types';
-import type { FlatHeading } from './toc';
 
 /** 一次渲染的输入 */
 export interface RenderInput {
@@ -17,76 +33,25 @@ export interface RenderInput {
   documentId: string;
 }
 
-/**
- * 各阶段耗时（毫秒）。
- *
- * 拆开记录而不是只报一个总数，是因为这四段的优化手段完全不同：
- * parse 只能靠分块摊平，sanitize 可以按块做，render 可以延迟到需要时。
- * 只看总耗时就只能猜是哪一段慢了。
- */
-export interface RenderStages {
-  /** markdown-it 解析成 token 流 */
-  parseMs: number;
-  /** 从 token 抽取目录 */
-  tocMs: number;
-  /** token 渲染成 HTML 字符串 */
-  renderMs: number;
-  /** DOMPurify 净化 */
-  sanitizeMs: number;
-}
-
 /** 一次渲染的产出 */
 export interface RenderResult {
   /** 渲染后的 HTML（已按设置做净化） */
   html: string;
   /** 从标题抽取的目录树 */
   toc: TocNode[];
-  /** 渲染耗时（毫秒），用于性能面板与回归监控 */
-  durationMs: number;
-  /** 各阶段耗时明细 */
-  stages: RenderStages;
-}
-
-/** 一块的渲染产出 */
-export interface ChunkResult {
-  /** 块序号，从 0 开始 */
-  index: number;
-  /** 本块的 HTML（已净化） */
-  html: string;
-  /** 本块内的扁平标题，全部到齐后统一折叠成树 */
-  headings: readonly FlatHeading[];
-  /** 本块各阶段耗时 */
-  stages: RenderStages;
-}
-
-/**
- * 一次分块渲染会话。
- *
- * 会话持有跨块共享的状态——markdown-it 的 `env`（脚注、引用定义）与
- * 锚点去重表。逐块调用 `renderChunk` 必须**按序**进行，否则锚点编号
- * 和脚注序号都会错乱。
- */
-export interface RenderSession {
-  /** 总块数；1 表示无需分块，等同于一次性渲染 */
-  readonly chunkCount: number;
-  /** 渲染第 index 块 */
-  renderChunk(index: number): ChunkResult;
-}
-
-/** 分块参数；不传则用渲染器的默认值 */
-export interface ChunkOptions {
-  /** 超过这个字符数才分块 */
-  thresholdChars?: number;
-  /** 每块的目标字符数 */
-  targetChars?: number;
 }
 
 /** 渲染器 */
 export interface MarkdownRenderer {
-  /** 执行渲染（一次性，用于小文档与测试） */
+  /** 一次性渲染整篇文档，用于离屏渲染与测试 */
   render(input: RenderInput): Promise<RenderResult>;
-  /** 开启一次分块渲染会话 */
-  createSession(input: RenderInput, options?: ChunkOptions): RenderSession;
   /** 设置变更后让内部缓存失效（例如插件开关被切换） */
   invalidate(): void;
+  /**
+   * 取出配置好插件的 markdown-it 实例。
+   *
+   * 编辑器按块渲染时需要自己掌控 parse 与 render 的时机——同一个 env 贯穿
+   * 全篇、逐块 render，这是一次成型的 `render()` 给不了的。
+   */
+  instance(settings: Settings): MarkdownIt;
 }

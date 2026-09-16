@@ -3,6 +3,7 @@ import { useDocumentStore } from '@/stores/document.store';
 import { useWorkspaceStore } from '@/stores/workspace.store';
 import { FilePickerCancelled, openMarkdownFile, reloadCurrentFile } from '@/utils/file-open';
 import { createLogger } from '@/utils/logger';
+import { confirmDiscardUnsaved } from './useAutoSave';
 
 const log = createLogger('use-open-file');
 
@@ -28,6 +29,9 @@ export function useOpenFile(): OpenFileActions {
   const addAvailablePath = useWorkspaceStore((state) => state.addAvailablePath);
 
   const open = useCallback(async () => {
+    // 打开新文件会顶掉当前这份；有未保存改动时先问一句，见 confirmDiscardUnsaved
+    if (!confirmDiscardUnsaved()) return;
+
     try {
       setLoading();
       const doc = await openMarkdownFile();

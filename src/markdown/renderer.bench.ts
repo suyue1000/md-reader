@@ -2,7 +2,6 @@ import { bench, describe } from 'vitest';
 import { DEFAULT_SETTINGS } from '@/types';
 import { ensureBuiltinPlugins } from '@/plugins';
 import { createMarkdownRenderer } from './renderer';
-import { splitSource } from './chunker';
 
 /**
  * 渲染管线基准。
@@ -43,13 +42,7 @@ function makeSource(sections: number): string {
 const SMALL = makeSource(20);
 const MEDIUM = makeSource(400);
 
-describe('切分', () => {
-  bench('splitSource 400 节', () => {
-    splitSource(MEDIUM, 128 * 1024);
-  });
-});
-
-describe('一次性渲染', () => {
+describe('整篇渲染', () => {
   const renderer = createMarkdownRenderer();
 
   bench('小文档（20 节）', async () => {
@@ -58,24 +51,5 @@ describe('一次性渲染', () => {
 
   bench('中等文档（400 节）', async () => {
     await renderer.render({ source: MEDIUM, settings: DEFAULT_SETTINGS, documentId: 'bench' });
-  });
-});
-
-describe('分块渲染', () => {
-  const renderer = createMarkdownRenderer();
-
-  /**
-   * 与「一次性渲染 / 中等文档」对照。
-   *
-   * 分块的每次调用都有固定开销（markdown-it 的 parse、DOMPurify 的初始化），
-   * 这一项明显慢于对照组就说明块被切得太碎了——历史上 64KB 就踩过这个坑，
-   * 净化总耗时从 105ms 涨到近 700ms。
-   */
-  bench('中等文档（400 节，逐块）', () => {
-    const session = renderer.createSession(
-      { source: MEDIUM, settings: DEFAULT_SETTINGS, documentId: 'bench' },
-      { thresholdChars: 1, targetChars: 128 * 1024 },
-    );
-    for (let i = 0; i < session.chunkCount; i++) session.renderChunk(i);
   });
 });

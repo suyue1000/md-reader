@@ -3,6 +3,7 @@ import { prepareExportFragment } from './dom-snapshot';
 import { buildStandaloneHtml } from './html';
 import { normalizeMarkdown } from './markdown';
 import { replaceExtension, saveFile } from './download';
+import { exportHtml, exportMarkdown, exportPdf, PRINT_ROOT_ID } from './index';
 
 /** 用一段 HTML 造一个正文节点 */
 function makeContent(html: string): HTMLElement {
@@ -223,5 +224,152 @@ describe('normalizeMarkdown', () => {
 
   it('全空白输入产出空串', () => {
     expect(normalizeMarkdown('\n\n\n')).toBe('');
+  });
+});
+
+describe('exportHtml 用调用方给的正文节点', () => {
+  const DOC = {
+    id: 'file:///tmp/a.md',
+    name: 'a.md',
+    path: '/tmp/a.md',
+    content: '旧内容',
+    size: 3,
+    lastModified: 0,
+    source: 'url' as const,
+  };
+
+  beforeEach(() => {
+    URL.createObjectURL = vi.fn(() => 'blob:stub');
+    URL.revokeObjectURL = vi.fn();
+  });
+
+  afterEach(() => {
+    document.body.replaceChildren();
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * 守的是这次改造的病根。
+   *
+   * 旧实现是 `document.querySelector('.markdown-body')`，而编辑器里**每个块
+   * widget 都带这个类名**，只会取到第一块。这里刻意在页面上先摆两个
+   * `.markdown-body`（模拟两个块 widget），再把完整正文作为参数传进去：
+   * 谁要是把选择器改回来，拿到的就是「只有第一块」那份。
+   */
+  it('页面上有多个 .markdown-body 时也不受影响', async () => {
+    for (const text of ['屏幕上的第一块', '屏幕上的第二块']) {
+      const stray = makeContent(`<p>${text}</p>`);
+      document.body.appendChild(stray);
+    }
+
+    const content = makeContent('<h1>完整标题</h1><p>第一段</p><p>最后一段</p>');
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    let saved = '';
+    (window as { showSaveFilePicker?: unknown }).showSaveFilePicker = undefined;
+    const blobs: Blob[] = [];
+    const originalBlobText = Blob.prototype.text;
+    Blob.prototype.text = function capture(this: Blob): Promise<string> {
+      blobs.push(this);
+      return originalBlobText.call(this);
+    };
+
+    const result = await exportHtml({ doc: DOC, theme: 'light', source: '源文本', content });
+    expect(result.status).toBe('done');
+    expect(click).toHaveBeenCalled();
+
+    Blob.prototype.text = originalBlobText;
+    saved = await (blobs[0] as Blob).text();
+    expect(saved).toContain('完整标题');
+    expect(saved).toContain('第一段');
+    expect(saved).toContain('最后一段');
+    expect(saved).not.toContain('屏幕上的第一块');
+  });
+});
+
+describe('exportMarkdown 导出的是传入的源文本', () => {
+  beforeEach(() => {
+    URL.createObjectURL = vi.fn(() => 'blob:stub');
+    URL.revokeObjectURL = vi.fn();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** store 里的 `doc.content` 可能落后一次尚未回写的改动，不能拿它当准 */
+  it('用 context.source 而不是 doc.content', async () => {
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    const blobs: Blob[] = [];
+    const originalBlobText = Blob.prototype.text;
+    Blob.prototype.text = function capture(this: Blob): Promise<string> {
+      blobs.push(this);
+      return originalBlobText.call(this);
+    };
+
+    await exportMarkdown({
+      doc: {
+        id: 'file:///tmp/a.md',
+        name: 'a.md',
+        path: '/tmp/a.md',
+        content: 'store 里的旧副本',
+        size: 3,
+        lastModified: 0,
+        source: 'url',
+      },
+      theme: 'light',
+      source: '编辑器里的新文本',
+    });
+
+    Blob.prototype.text = originalBlobText;
+    const text = await (blobs[0] as Blob).text();
+    expect(text).toBe('编辑器里的新文本\n');
+  });
+});
+
+describe('exportPdf', () => {
+  afterEach(() => {
+    document.body.replaceChildren();
+    vi.restoreAllMocks();
+  });
+
+  it('把完整正文挂进 #print-root，afterprint 之后撤掉', () => {
+    const print = vi.spyOn(window, 'print').mockImplementation(() => undefined);
+    const content = makeContent('<h1>完整标题</h1><p>最后一段</p>');
+
+    exportPdf(content);
+
+    const root = document.getElementById(PRINT_ROOT_ID);
+    expect(root).not.toBeNull();
+    expect(root?.textContent).toContain('完整标题');
+    expect(root?.textContent).toContain('最后一段');
+    expect(print).toHaveBeenCalled();
+
+    window.dispatchEvent(new Event('afterprint'));
+    expect(document.getElementById(PRINT_ROOT_ID)).toBeNull();
+  });
+
+  it('挂进去的是克隆，原节点不被搬走', () => {
+    vi.spyOn(window, 'print').mockImplementation(() => undefined);
+    const host = document.createElement('div');
+    const content = makeContent('<p>正文</p>');
+    host.appendChild(content);
+    document.body.appendChild(host);
+
+    exportPdf(content);
+
+    // 离屏渲染那棵树的所有权仍在调用方手上，dispose 还要靠它
+    expect(content.parentElement).toBe(host);
+  });
+
+  it('纸上不留只有 JS 才能用的按钮', () => {
+    vi.spyOn(window, 'print').mockImplementation(() => undefined);
+    exportPdf(
+      makeContent(
+        '<figure class="code-block"><figcaption class="code-block__bar">' +
+          '<span class="code-block__actions"><button>复制</button></span>' +
+          '</figcaption><pre><code>x</code></pre></figure>',
+      ),
+    );
+    expect(document.querySelector(`#${PRINT_ROOT_ID} .code-block__actions`)).toBeNull();
   });
 });

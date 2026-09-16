@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_SETTINGS } from '@/types';
-import { createMemoryStorageDriver, setStorageDriver } from '@/utils/storage';
+import {
+  STORAGE_AREAS,
+  STORAGE_KEYS,
+  createMemoryStorageDriver,
+  setStorageDriver,
+  writeValue,
+} from '@/utils/storage';
 import { useSettingsStore } from './settings.store';
 
 describe('settings store', () => {
@@ -69,6 +75,39 @@ describe('settings store', () => {
   it('未知主题 id 回落到默认主题', () => {
     useSettingsStore.getState().setReadingTheme('不存在的主题');
     expect(useSettingsStore.getState().settings.appearance.readingTheme).toBe('github');
+  });
+
+  it('从 schemaVersion 1 的旧结构升级：editor 分组补上默认值，其余分组的自定义值原样保留', async () => {
+    // 这是 R28 的实测：SETTINGS_SCHEMA_VERSION 从 1 升到 2 时新增了 editor 分组，
+    // 计划里写的是「不写迁移脚本，靠 hydrate 里的 deep-merge 兜底」。
+    // 本项目已经在 ReadingPosition 改结构时吃过一次同类亏——升级后旧数据被直接断言
+    // 成新类型，缺失字段变成 undefined 一路传导到渲染层，最终白屏。
+    // 所以这里不能只读代码就相信"deep-merge 会兜住"，必须绕开 store 的现有类型定义，
+    // 手写一份 schemaVersion:1 时代、真正没有 editor 字段的存量数据直接写入存储，
+    // 再走 hydrate 这条真实读取路径，实测升级后的行为。
+    const legacySynced = {
+      schemaVersion: 1,
+      appearance: { ...DEFAULT_SETTINGS.appearance, fontSize: 20 }, // 用户改过的旧字段
+      markdown: DEFAULT_SETTINGS.markdown,
+      reading: { ...DEFAULT_SETTINGS.reading, scrollSync: false }, // 用户改过的旧字段
+      // 故意不写 editor：schemaVersion 1 时这个分组还不存在
+    };
+    const legacyAdvanced = { ...DEFAULT_SETTINGS.advanced, customCss: 'body{color:red}' };
+
+    await writeValue(STORAGE_AREAS.settings, STORAGE_KEYS.settings, legacySynced);
+    await writeValue(STORAGE_AREAS.advanced, STORAGE_KEYS.advanced, legacyAdvanced);
+
+    await useSettingsStore.getState().hydrate();
+    const { settings } = useSettingsStore.getState();
+
+    // 确认 1：editor 分组存在且是默认值（旧数据里压根没有这个 key）
+    expect(settings.editor).toEqual(DEFAULT_SETTINGS.editor);
+    // 确认 2：其余分组没有被 deep-merge 误伤——用户在旧结构里改过的值原样保留
+    expect(settings.appearance.fontSize).toBe(20);
+    expect(settings.reading.scrollSync).toBe(false);
+    expect(settings.advanced.customCss).toBe('body{color:red}');
+    // 确认 3：结构版本号以代码为准前进到 2，不会卡在旧值上
+    expect(settings.schemaVersion).toBe(2);
   });
 
   it('resetGroup 只重置指定分组', () => {

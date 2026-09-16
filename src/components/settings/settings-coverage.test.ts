@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_SETTINGS } from '@/types';
 import { MARKDOWN_TOGGLES } from './sections/MarkdownSection';
+import { EDITOR_FIELD_KEYS } from './sections/EditorSection';
 
 /**
  * 防漂移测试。
@@ -25,5 +26,17 @@ describe('设置页覆盖度', () => {
     for (const toggle of MARKDOWN_TOGGLES) {
       expect(toggle.label.trim()).not.toBe('');
     }
+  });
+});
+
+describe('编辑设置页覆盖度', () => {
+  it('每个编辑设置项都在设置页里出现', () => {
+    const declared = Object.keys(DEFAULT_SETTINGS.editor).sort();
+    const exposed = EDITOR_FIELD_KEYS.map(String).sort();
+    expect(exposed).toEqual(declared);
+  });
+
+  it('编辑设置页没有重复的字段', () => {
+    expect(new Set(EDITOR_FIELD_KEYS).size).toBe(EDITOR_FIELD_KEYS.length);
   });
 });

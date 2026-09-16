@@ -1,41 +1,12 @@
 import MarkdownIt from 'markdown-it';
 import type { PluginContext, PluginRegistry, Settings } from '@/types';
-import type {
-  ChunkOptions,
-  ChunkResult,
-  MarkdownRenderer,
-  RenderInput,
-  RenderResult,
-  RenderSession,
-  RenderStages,
-} from './contract';
+import type { MarkdownRenderer, RenderInput, RenderResult } from './contract';
 import { pluginRegistry as defaultRegistry } from '@/plugins';
-import { splitSource } from './chunker';
 import { sanitizeHtml } from './sanitize';
-import { buildTocTree, collectHeadings, type FlatHeading } from './toc';
+import { buildTocTree, collectHeadings } from './toc';
 import { createLogger } from '@/utils/logger';
 
 const log = createLogger('renderer');
-
-/**
- * 超过这个字符数才启用分块。
- *
- * 定在 256KB：实测 1MB 文档一次渲染 164ms、主线程冻结 621ms，
- * 按比例 256KB 约 40ms/150ms，仍在「一次做完更划算」的范围内。
- * 阈值以下多走一轮调度反而是净损失。
- */
-export const CHUNK_THRESHOLD_CHARS = 256 * 1024;
-
-/**
- * 每块的目标字符数。
- *
- * 分块不是免费的：`md.parse()` 与 DOMPurify 都有可观的**每次调用固定开销**
- * （实测各约 24ms 与 36ms，与块的大小无关）。块切得越碎，这笔固定成本
- * 乘的次数越多——64KB 时 1MB 文档的净化总耗时从 105ms 涨到近 700ms。
- * 128KB 是实测下来的平衡点：单块任务仍在百毫秒量级不至于卡顿，
- * 固定开销的总量也还在可接受范围。
- */
-export const CHUNK_TARGET_CHARS = 128 * 1024;
 
 /** 创建渲染器所需的依赖，全部可注入以便单测 */
 export interface RendererOptions {
@@ -43,17 +14,6 @@ export interface RendererOptions {
   registry?: PluginRegistry;
   /** 插件请求重新渲染时的回调（如 Mermaid 异步出图完成） */
   onRerenderRequest?: () => void;
-}
-
-/**
- * 执行一步并记下完成时刻。
- *
- * 写成辅助函数而不是在每一步之间穿插 `performance.now()`，是为了让
- * 渲染主流程读起来仍是四个连续的步骤，而不是被计时代码切碎。
- */
-function mark<T>(step: () => T): { value: T; at: number } {
-  const value = step();
-  return { value, at: performance.now() };
 }
 
 /**
@@ -124,74 +84,33 @@ class MarkdownItRenderer implements MarkdownRenderer {
   }
 
   /**
-   * 开启一次分块渲染会话。
+   * 一次性渲染整篇文档。
    *
-   * 小于阈值的文档只会得到一块，此时会话等价于一次性渲染——
-   * 分块与不分块因此共用同一条代码路径，不存在「大文档专用分支」
-   * 会在日常使用中长期得不到验证的问题。
+   * 四步一趟走完：parse → 抽目录 → render → 净化。
+   *
+   * 为什么 `env` 在 parse 与 render 之间传的是同一个对象：这是 markdown-it 自己
+   * `md.render()` 的写法，也是它给插件的约定——插件可以在 parse 阶段往 env 里
+   * 存东西、在 renderer 规则里取回。
+   *
+   * **实测**（Task 11）当前启用的这套插件里没有一个真的依赖它：把 render 那侧
+   * 换成空对象，脚注 + 引用式链接的产出逐字节相同（footnote_tail 与引用解析都在
+   * parse 阶段就把 token 改完了）。所以这里没有对应的用例——照约定传是为了将来
+   * 装上一个依赖 env 的插件时不会莫名其妙地坏掉，不是在修复某个已知的症状。
+   *
+   * 返回 Promise 而不是同步值：这是**接口留给将来的余地**——渲染若要挪进
+   * Worker 或拆成多趟，签名不必再动。当下的实现是同步完成后立刻兑现的。
    */
-  createSession(input: RenderInput, options: ChunkOptions = {}): RenderSession {
-    const md = this.ensureInstance(input.settings);
-    // env 承载脚注、引用定义与锚点去重表，必须由整个会话共享
-    const env: Record<string, unknown> = {};
-    const wantToc = input.settings.markdown.toc;
-
-    const threshold = options.thresholdChars ?? CHUNK_THRESHOLD_CHARS;
-    const target = options.targetChars ?? CHUNK_TARGET_CHARS;
-    const chunks =
-      input.source.length > threshold
-        ? splitSource(input.source, target)
-        : [{ text: input.source, start: 0 }];
-
-    return {
-      chunkCount: chunks.length,
-      renderChunk: (index: number): ChunkResult => {
-        const chunk = chunks[index];
-        if (!chunk) throw new RangeError(`块序号越界：${String(index)}`);
-
-        const startedAt = performance.now();
-        const afterParse = mark(() => md.parse(chunk.text, env));
-        const afterToc = mark(() => (wantToc ? collectHeadings(afterParse.value) : []));
-        const afterRender = mark(() => md.renderer.render(afterParse.value, md.options, env));
-        const afterSanitize = mark(() => sanitizeHtml(afterRender.value, input.settings));
-
-        return {
-          index,
-          html: afterSanitize.value,
-          headings: afterToc.value,
-          stages: {
-            parseMs: afterParse.at - startedAt,
-            tocMs: afterToc.at - afterParse.at,
-            renderMs: afterRender.at - afterToc.at,
-            sanitizeMs: afterSanitize.at - afterRender.at,
-          },
-        };
-      },
-    };
-  }
-
-  /** 一次性渲染整篇文档 */
   render(input: RenderInput): Promise<RenderResult> {
-    const session = this.createSession(input);
-    const parts: string[] = [];
-    const headings: FlatHeading[] = [];
-    const stages: RenderStages = { parseMs: 0, tocMs: 0, renderMs: 0, sanitizeMs: 0 };
+    const md = this.ensureInstance(input.settings);
+    const env: Record<string, unknown> = {};
 
-    for (let i = 0; i < session.chunkCount; i++) {
-      const chunk = session.renderChunk(i);
-      parts.push(chunk.html);
-      headings.push(...chunk.headings);
-      stages.parseMs += chunk.stages.parseMs;
-      stages.tocMs += chunk.stages.tocMs;
-      stages.renderMs += chunk.stages.renderMs;
-      stages.sanitizeMs += chunk.stages.sanitizeMs;
-    }
+    const tokens = md.parse(input.source, env);
+    const headings = input.settings.markdown.toc ? collectHeadings(tokens) : [];
+    const html = md.renderer.render(tokens, md.options, env);
 
     return Promise.resolve({
-      html: parts.join(''),
+      html: sanitizeHtml(html, input.settings),
       toc: buildTocTree(headings),
-      durationMs: stages.parseMs + stages.tocMs + stages.renderMs + stages.sanitizeMs,
-      stages,
     });
   }
 
@@ -199,6 +118,10 @@ class MarkdownItRenderer implements MarkdownRenderer {
   invalidate(): void {
     this.md = null;
     this.signature = '';
+  }
+
+  instance(settings: Settings): MarkdownIt {
+    return this.ensureInstance(settings);
   }
 }
 

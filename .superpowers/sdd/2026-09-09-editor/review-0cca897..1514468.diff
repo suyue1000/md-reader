@@ -1,0 +1,468 @@
+# Review package: 0cca897..HEAD
+
+## Commits
+1514468 feat: 引入 CodeMirror 6 依赖
+
+## Files changed
+ package-lock.json        | 239 +++++++++++++++++++++++++++++++++++++++++++++++
+ package.json             |   7 ++
+ src/editor/smoke.test.ts |  10 ++
+ vite.config.ts           |  13 +--
+ 4 files changed, 263 insertions(+), 6 deletions(-)
+
+## Diff
+diff --git a/package-lock.json b/package-lock.json
+index 74fd699..dc857a6 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,20 +1,27 @@
+ {
+   "name": "md-reader",
+   "version": "0.1.0",
+   "lockfileVersion": 3,
+   "requires": true,
+   "packages": {
+     "": {
+       "name": "md-reader",
+       "version": "0.1.0",
+       "dependencies": {
++        "@codemirror/commands": "^6.11.0",
++        "@codemirror/lang-markdown": "^6.5.2",
++        "@codemirror/language": "^6.12.4",
++        "@codemirror/search": "^6.7.2",
++        "@codemirror/state": "^6.7.4",
++        "@codemirror/view": "^6.43.11",
++        "@lezer/highlight": "^1.2.3",
+         "@vscode/markdown-it-katex": "^1.1.2",
+         "clsx": "^2.1.1",
+         "dompurify": "^3.4.12",
+         "katex": "^0.18.1",
+         "lucide-react": "^0.468.0",
+         "markdown-it": "^14.3.0",
+         "markdown-it-anchor": "^9.2.1",
+         "markdown-it-container": "^4.0.0",
+         "markdown-it-deflist": "^4.0.0",
+         "markdown-it-emoji": "^3.1.0",
+@@ -385,20 +392,161 @@
+       "resolved": "https://registry.npmjs.org/@braintree/sanitize-url/-/sanitize-url-7.1.2.tgz",
+       "integrity": "sha512-jigsZK+sMF/cuiB7sERuo9V7N9jx+dhmHHnQyDSVdpZwVutaBu7WvNYqMDLSgFgfB30n452TP3vjDAvFC973mA==",
+       "license": "MIT"
+     },
+     "node_modules/@chevrotain/types": {
+       "version": "11.1.2",
+       "resolved": "https://registry.npmjs.org/@chevrotain/types/-/types-11.1.2.tgz",
+       "integrity": "sha512-U+HFai5+zmJCkK86QsaJtoITlboZHBqrVketcO2ROv865xfCMSFpELQoz1GkX5GzME8pTa+3kbKrZHQtI0gdbw==",
+       "license": "Apache-2.0"
+     },
++    "node_modules/@codemirror/autocomplete": {
++      "version": "6.20.3",
++      "resolved": "https://registry.npmjs.org/@codemirror/autocomplete/-/autocomplete-6.20.3.tgz",
++      "integrity": "sha512-tlosUqb+3BbxCxZdu4tKeRghPFC+QM7q4X5YhKV2eCmPG+1r2F3f4AaSz5sCrFqUtX4Jh20VFTKecl16MgiV9g==",
++      "license": "MIT",
++      "dependencies": {
++        "@codemirror/language": "^6.0.0",
++        "@codemirror/state": "^6.0.0",
++        "@codemirror/view": "^6.17.0",
++        "@lezer/common": "^1.0.0"
++      }
++    },
++    "node_modules/@codemirror/commands": {
++      "version": "6.11.0",
++      "resolved": "https://registry.npmjs.org/@codemirror/commands/-/commands-6.11.0.tgz",
++      "integrity": "sha512-/K4Rl5BN0OtTiPWmJCdqODu38XnDMsDxKY5rgrPnCkutPTJf2wVbkoixLfealF5Kwse/s8P8M5jAiURiwSwnFA==",
++      "license": "MIT",
++      "dependencies": {
++        "@codemirror/language": "^6.0.0",
++        "@codemirror/state": "^6.7.0",
++        "@codemirror/view": "^6.27.0",
++        "@lezer/common": "^1.1.0"
++      }
++    },
++    "node_modules/@codemirror/lang-css": {
++      "version": "6.3.1",
++      "resolved": "https://registry.npmjs.org/@codemirror/lang-css/-/lang-css-6.3.1.tgz",
++      "integrity": "sha512-kr5fwBGiGtmz6l0LSJIbno9QrifNMUusivHbnA1H6Dmqy4HZFte3UAICix1VuKo0lMPKQr2rqB+0BkKi/S3Ejg==",
++      "license": "MIT",
++      "dependencies": {
++        "@codemirror/autocomplete": "^6.0.0",
++        "@codemirror/language": "^6.0.0",
++        "@codemirror/state": "^6.0.0",
++        "@lezer/common": "^1.0.2",
++        "@lezer/css": "^1.1.7"
++      }
++    },
++    "node_modules/@codemirror/lang-html": {
++      "version": "6.4.12",
++      "resolved": "https://registry.npmjs.org/@codemirror/lang-html/-/lang-html-6.4.12.tgz",
++      "integrity": "sha512-pw2ReWKUqSkbvh76RAT4NYxiogRu+PWkR2ukAwO9uOgrm8uipkzjtKKtNpyeAQwHOqxEeSvAXZ6vr3AfyB9y/w==",
++      "license": "MIT",
++      "dependencies": {
++        "@codemirror/autocomplete": "^6.0.0",
++        "@codemirror/lang-css": "^6.0.0",
++        "@codemirror/lang-javascript": "^6.0.0",
++        "@codemirror/language": "^6.4.0",
++        "@codemirror/state": "^6.0.0",
++        "@codemirror/view": "^6.17.0",
++        "@lezer/common": "^1.0.0",
++        "@lezer/css": "^1.1.0",
++        "@lezer/html": "^1.3.12"
++      }
++    },
++    "node_modules/@codemirror/lang-javascript": {
++      "version": "6.2.5",
++      "resolved": "https://registry.npmjs.org/@codemirror/lang-javascript/-/lang-javascript-6.2.5.tgz",
++      "integrity": "sha512-zD4e5mS+50htS7F+TYjBPsiIFGanfVqg4HyUz6WNFikgOPf2BgKlx+TQedI1w6n/IqRBVBbBWmGFdLB/7uxO4A==",
++      "license": "MIT",
++      "dependencies": {
++        "@codemirror/autocomplete": "^6.0.0",
++        "@codemirror/language": "^6.6.0",
++        "@codemirror/lint": "^6.0.0",
++        "@codemirror/state": "^6.0.0",
++        "@codemirror/view": "^6.17.0",
++        "@lezer/common": "^1.0.0",
++        "@lezer/javascript": "^1.0.0"
++      }
++    },
++    "node_modules/@codemirror/lang-markdown": {
++      "version": "6.5.2",
++      "resolved": "https://registry.npmjs.org/@codemirror/lang-markdown/-/lang-markdown-6.5.2.tgz",
++      "integrity": "sha512-AwBOdkWYuA//WcM0xO5PfHPUcmz/O2i5o0Nsg1U69SII/loCJlFI1Romd9xp2HYb1kYJRGZotyqRghuHH5n8Kw==",
++      "license": "MIT",
++      "dependencies": {
++        "@codemirror/autocomplete": "^6.7.1",
++        "@codemirror/lang-html": "^6.0.0",
++        "@codemirror/language": "^6.3.0",
++        "@codemirror/state": "^6.0.0",
++        "@codemirror/view": "^6.0.0",
++        "@lezer/common": "^1.2.1",
++        "@lezer/markdown": "^1.0.0"
++      }
++    },
++    "node_modules/@codemirror/language": {
++      "version": "6.12.4",
++      "resolved": "https://registry.npmjs.org/@codemirror/language/-/language-6.12.4.tgz",
++      "integrity": "sha512-1q4PaT+o6PbgpkJt4Q8Fv5XJxTy4FUZ4MWETtyiDw3J0Pyr9E2vqcKL+k9wcvjNTIsauxvE7OfmWj3FRPHQ76A==",
++      "license": "MIT",
++      "dependencies": {
++        "@codemirror/state": "^6.0.0",
++        "@codemirror/view": "^6.23.0",
++        "@lezer/common": "^1.5.0",
++        "@lezer/highlight": "^1.0.0",
++        "@lezer/lr": "^1.0.0",
++        "style-mod": "^4.0.0"
++      }
++    },
++    "node_modules/@codemirror/lint": {
++      "version": "6.9.7",
++      "resolved": "https://registry.npmjs.org/@codemirror/lint/-/lint-6.9.7.tgz",
++      "integrity": "sha512-28/+iWLYxKxsvGYhSYL7zaCZqLz5+FFFDq9tVsvGv9kv8RY4fFAchJ5WX9M3YrrRlTIsECjsXPqeNgnSmNP2dg==",
++      "license": "MIT",
++      "dependencies": {
++        "@codemirror/state": "^6.0.0",
++        "@codemirror/view": "^6.42.0",
++        "crelt": "^1.0.5"
++      }
++    },
++    "node_modules/@codemirror/search": {
++      "version": "6.7.2",
++      "resolved": "https://registry.npmjs.org/@codemirror/search/-/search-6.7.2.tgz",
++      "integrity": "sha512-gUYkYhT2+n/+VGZ+8EzE5WFkYZUZYm1VOKDudIsNqh42uRVQJ0a6Yss9sdKT3MeOYfuL1N6AZA57oza0Oyr0LA==",
++      "license": "MIT",
++      "dependencies": {
++        "@codemirror/state": "^6.0.0",
++        "@codemirror/view": "^6.37.0",
++        "crelt": "^1.0.5"
++      }
++    },
++    "node_modules/@codemirror/state": {
++      "version": "6.7.4",
++      "resolved": "https://registry.npmjs.org/@codemirror/state/-/state-6.7.4.tgz",
++      "integrity": "sha512-QhQIVRY+xHZDxwOSFrJ1eUMapJBUID3IdeAjf7dHO7zBUzSkyooHiodnalz5MG3iHzwixKMlAAyn7244y537EA==",
++      "license": "MIT",
++      "dependencies": {
++        "@marijn/find-cluster-break": "^1.0.0"
++      }
++    },
++    "node_modules/@codemirror/view": {
++      "version": "6.43.11",
++      "resolved": "https://registry.npmjs.org/@codemirror/view/-/view-6.43.11.tgz",
++      "integrity": "sha512-2+esucbQX6wB2JYi1eDvdCPFTA31BN8oSy6xCmk3G6CloV11yOvEjYk+gH7kLrP0MuHG94E8WDhjs5oMiu3+Wg==",
++      "license": "MIT",
++      "dependencies": {
++        "@codemirror/state": "^6.7.0",
++        "crelt": "^1.0.6",
++        "style-mod": "^4.1.0",
++        "w3c-keyname": "^2.2.4"
++      }
++    },
+     "node_modules/@csstools/color-helpers": {
+       "version": "5.1.0",
+       "resolved": "https://registry.npmjs.org/@csstools/color-helpers/-/color-helpers-5.1.0.tgz",
+       "integrity": "sha512-S11EXWJyy0Mz5SYvRmY8nJYTFFd1LCNV+7cXyAgQtOOuzb4EsgfqDufL+9esx72/eLhsRdGZwaldu/h+E4t4BA==",
+       "dev": true,
+       "funding": [
+         {
+           "type": "github",
+           "url": "https://github.com/sponsors/csstools"
+         },
+@@ -1203,20 +1351,93 @@
+       "version": "0.3.31",
+       "resolved": "https://registry.npmjs.org/@jridgewell/trace-mapping/-/trace-mapping-0.3.31.tgz",
+       "integrity": "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==",
+       "dev": true,
+       "license": "MIT",
+       "dependencies": {
+         "@jridgewell/resolve-uri": "^3.1.0",
+         "@jridgewell/sourcemap-codec": "^1.4.14"
+       }
+     },
++    "node_modules/@lezer/common": {
++      "version": "1.5.2",
++      "resolved": "https://registry.npmjs.org/@lezer/common/-/common-1.5.2.tgz",
++      "integrity": "sha512-sxQE460fPZyU3sdc8lafxiPwJHBzZRy/udNFynGQky1SePYBdhkBl1kOagA9uT3pxR8K09bOrmTUqA9wb/PjSQ==",
++      "license": "MIT"
++    },
++    "node_modules/@lezer/css": {
++      "version": "1.3.6",
++      "resolved": "https://registry.npmjs.org/@lezer/css/-/css-1.3.6.tgz",
++      "integrity": "sha512-YJE78Wcg+zX8f10hiHWQ4Az48Qr/c13eId0VtRQYLBpxHDmDeSrXIlkbl+fJGW42rWC/uoUco9mhBZeVWP/A1g==",
++      "license": "MIT",
++      "dependencies": {
++        "@lezer/common": "^1.2.0",
++        "@lezer/highlight": "^1.0.0",
++        "@lezer/lr": "^1.3.0"
++      }
++    },
++    "node_modules/@lezer/highlight": {
++      "version": "1.2.3",
++      "resolved": "https://registry.npmjs.org/@lezer/highlight/-/highlight-1.2.3.tgz",
++      "integrity": "sha512-qXdH7UqTvGfdVBINrgKhDsVTJTxactNNxLk7+UMwZhU13lMHaOBlJe9Vqp907ya56Y3+ed2tlqzys7jDkTmW0g==",
++      "license": "MIT",
++      "dependencies": {
++        "@lezer/common": "^1.3.0"
++      }
++    },
++    "node_modules/@lezer/html": {
++      "version": "1.3.13",
++      "resolved": "https://registry.npmjs.org/@lezer/html/-/html-1.3.13.tgz",
++      "integrity": "sha512-oI7n6NJml729m7pjm9lvLvmXbdoMoi2f+1pwSDJkl9d68zGr7a9Btz8NdHTGQZtW2DA25ybeuv/SyDb9D5tseg==",
++      "license": "MIT",
++      "dependencies": {
++        "@lezer/common": "^1.2.0",
++        "@lezer/highlight": "^1.0.0",
++        "@lezer/lr": "^1.0.0"
++      }
++    },
++    "node_modules/@lezer/javascript": {
++      "version": "1.5.4",
++      "resolved": "https://registry.npmjs.org/@lezer/javascript/-/javascript-1.5.4.tgz",
++      "integrity": "sha512-vvYx3MhWqeZtGPwDStM2dwgljd5smolYD2lR2UyFcHfxbBQebqx8yjmFmxtJ/E6nN6u1D9srOiVWm3Rb4tmcUA==",
++      "license": "MIT",
++      "dependencies": {
++        "@lezer/common": "^1.2.0",
++        "@lezer/highlight": "^1.1.3",
++        "@lezer/lr": "^1.3.0"
++      }
++    },
++    "node_modules/@lezer/lr": {
++      "version": "1.4.10",
++      "resolved": "https://registry.npmjs.org/@lezer/lr/-/lr-1.4.10.tgz",
++      "integrity": "sha512-rnCpTIBafOx4mRp43xOxDJbFipJm/c0cia/V5TiGlhmMa+wsSdoGmUN3w5Bqrks/09Q/D4tNAmWaT8p6NRi77A==",
++      "license": "MIT",
++      "dependencies": {
++        "@lezer/common": "^1.0.0"
++      }
++    },
++    "node_modules/@lezer/markdown": {
++      "version": "1.7.2",
++      "resolved": "https://registry.npmjs.org/@lezer/markdown/-/markdown-1.7.2.tgz",
++      "integrity": "sha512-iTkYvoVcKt3WkeL7qUDyXHONZEwLio4wj8KTNi2dnjQEXBZKMV63BpQrPqfsM+OkvuRbiSTAcycYAsQzLhRNoQ==",
++      "license": "MIT",
++      "dependencies": {
++        "@lezer/common": "^1.5.0",
++        "@lezer/highlight": "^1.0.0"
++      }
++    },
++    "node_modules/@marijn/find-cluster-break": {
++      "version": "1.0.4",
++      "resolved": "https://registry.npmjs.org/@marijn/find-cluster-break/-/find-cluster-break-1.0.4.tgz",
++      "integrity": "sha512-Wy0V7+SGUjnF9/TkiM1hKVDPj7jKXduPNboMVtHTA8dySMURWqfg/JZ9E2Sq8JgSJmkl7k7Qe9FLeMSrSraWmQ==",
++      "license": "MIT"
++    },
+     "node_modules/@mermaid-js/parser": {
+       "version": "1.2.0",
+       "resolved": "https://registry.npmjs.org/@mermaid-js/parser/-/parser-1.2.0.tgz",
+       "integrity": "sha512-oYPyv8A4As1yH5Bx+04iQEQxXuIQDe0GKCNSRgao6z8AM9jixXIfP0vsppRLvGf+nKIOb9/LdpWA4YuJiVvESA==",
+       "license": "MIT",
+       "dependencies": {
+         "@chevrotain/types": "~11.1.2"
+       }
+     },
+     "node_modules/@rolldown/pluginutils": {
+@@ -3189,20 +3410,26 @@
+     },
+     "node_modules/cose-base": {
+       "version": "1.0.3",
+       "resolved": "https://registry.npmjs.org/cose-base/-/cose-base-1.0.3.tgz",
+       "integrity": "sha512-s9whTXInMSgAp/NVXVNuVxVKzGH2qck3aQlVHxDCdAEPgtMKwc4Wq6/QKhgdEdgbLSi9rBTAcPoRa6JpiG4ksg==",
+       "license": "MIT",
+       "dependencies": {
+         "layout-base": "^1.0.0"
+       }
+     },
++    "node_modules/crelt": {
++      "version": "1.0.7",
++      "resolved": "https://registry.npmjs.org/crelt/-/crelt-1.0.7.tgz",
++      "integrity": "sha512-aK6BbWfhf4U/wCcLHKPJl/xa6VkVstRaPywWtMKGwuOLc/wZTyQYuoxgvZnNsBvv7Kg3YTBQYYBCggcviQczuA==",
++      "license": "MIT"
++    },
+     "node_modules/cross-spawn": {
+       "version": "7.0.6",
+       "resolved": "https://registry.npmjs.org/cross-spawn/-/cross-spawn-7.0.6.tgz",
+       "integrity": "sha512-uV2QOWP2nWzsy2aMp8aRibhi9dlzF5Hgh5SHaB9OiTGEyDTiJJyx0uy51QXdyWbtAHNua4XJzUKca3OzKUd3vA==",
+       "dev": true,
+       "license": "MIT",
+       "dependencies": {
+         "path-key": "^3.1.0",
+         "shebang-command": "^2.0.0",
+         "which": "^2.0.1"
+@@ -6152,20 +6379,26 @@
+       "license": "MIT",
+       "dependencies": {
+         "character-entities-html4": "^2.0.0",
+         "character-entities-legacy": "^3.0.0"
+       },
+       "funding": {
+         "type": "github",
+         "url": "https://github.com/sponsors/wooorm"
+       }
+     },
++    "node_modules/style-mod": {
++      "version": "4.1.3",
++      "resolved": "https://registry.npmjs.org/style-mod/-/style-mod-4.1.3.tgz",
++      "integrity": "sha512-i/n8VsZydrugj3Iuzll8+x/00GH2vnYsk1eomD8QiRrSAeW6ItbCQDtfXCeJHd0iwiNagqjQkvpvREEPtW3IoQ==",
++      "license": "MIT"
++    },
+     "node_modules/stylis": {
+       "version": "4.4.0",
+       "resolved": "https://registry.npmjs.org/stylis/-/stylis-4.4.0.tgz",
+       "integrity": "sha512-5Z9ZpRzfuH6l/UAvCPAPUo3665Nk2wLaZU3x+TLHKVzIz33+sbJqbtrYoC3KD4/uVOr2Zp+L0LySezP9OHV9yA==",
+       "license": "MIT"
+     },
+     "node_modules/symbol-tree": {
+       "version": "3.2.4",
+       "resolved": "https://registry.npmjs.org/symbol-tree/-/symbol-tree-3.2.4.tgz",
+       "integrity": "sha512-9QNk5KwDF+Bvz+PyObkmSYjI5ksVUYtjW7AU22r2NKcfLJcXp96hkDWU3+XndOsUb+AQ9QhfzfCT2O+CNWT5Tw==",
+@@ -6686,20 +6919,26 @@
+           "optional": true
+         },
+         "jsdom": {
+           "optional": true
+         },
+         "vite": {
+           "optional": false
+         }
+       }
+     },
++    "node_modules/w3c-keyname": {
++      "version": "2.2.8",
++      "resolved": "https://registry.npmjs.org/w3c-keyname/-/w3c-keyname-2.2.8.tgz",
++      "integrity": "sha512-dpojBhNsCNN7T82Tm7k26A6G9ML3NkhDsnw9n/eoxSRlVBB4CEtIQ/KTCLI2Fwf3ataSXRhYFkQi3SlnFwPvPQ==",
++      "license": "MIT"
++    },
+     "node_modules/w3c-xmlserializer": {
+       "version": "5.0.0",
+       "resolved": "https://registry.npmjs.org/w3c-xmlserializer/-/w3c-xmlserializer-5.0.0.tgz",
+       "integrity": "sha512-o8qghlI8NZHU1lLPrpi2+Uq7abh4GGPpYANlalzWxyWteJOCsr/P+oPBA49TOLu5FTZO4d3F9MnWJfiMo4BkmA==",
+       "dev": true,
+       "license": "MIT",
+       "dependencies": {
+         "xml-name-validator": "^5.0.0"
+       },
+       "engines": {
+diff --git a/package.json b/package.json
+index b3b644a..4cc5c70 100644
+--- a/package.json
++++ b/package.json
+@@ -18,20 +18,27 @@
+     "lint:fix": "eslint . --fix",
+     "format": "prettier --write .",
+     "format:check": "prettier --check .",
+     "test": "vitest run",
+     "test:watch": "vitest",
+     "verify": "npm run typecheck && npm run lint && npm run test",
+     "bench": "vitest bench --run",
+     "package": "npm run build && node scripts/package.mjs"
+   },
+   "dependencies": {
++    "@codemirror/commands": "^6.11.0",
++    "@codemirror/lang-markdown": "^6.5.2",
++    "@codemirror/language": "^6.12.4",
++    "@codemirror/search": "^6.7.2",
++    "@codemirror/state": "^6.7.4",
++    "@codemirror/view": "^6.43.11",
++    "@lezer/highlight": "^1.2.3",
+     "@vscode/markdown-it-katex": "^1.1.2",
+     "clsx": "^2.1.1",
+     "dompurify": "^3.4.12",
+     "katex": "^0.18.1",
+     "lucide-react": "^0.468.0",
+     "markdown-it": "^14.3.0",
+     "markdown-it-anchor": "^9.2.1",
+     "markdown-it-container": "^4.0.0",
+     "markdown-it-deflist": "^4.0.0",
+     "markdown-it-emoji": "^3.1.0",
+diff --git a/src/editor/smoke.test.ts b/src/editor/smoke.test.ts
+new file mode 100644
+index 0000000..8dc4f4f
+--- /dev/null
++++ b/src/editor/smoke.test.ts
+@@ -0,0 +1,10 @@
++import { describe, expect, it } from 'vitest';
++import { EditorState } from '@codemirror/state';
++
++describe('CodeMirror 依赖', () => {
++  it('能创建 EditorState 并按行读回文本', () => {
++    const state = EditorState.create({ doc: '# 标题\n\n正文' });
++    expect(state.doc.lines).toBe(3);
++    expect(state.doc.line(1).text).toBe('# 标题');
++  });
++});
+diff --git a/vite.config.ts b/vite.config.ts
+index 3c4393f..b7e7b4b 100644
+--- a/vite.config.ts
++++ b/vite.config.ts
+@@ -32,26 +32,27 @@ export default defineConfig({
+ 
+   build: {
+     outDir: 'dist',
+     emptyOutDir: true,
+     // 扩展页面全部本地加载，sourcemap 便于调试，体积不敏感
+     sourcemap: true,
+     target: 'chrome116',
+     /**
+      * 提高「分包过大」的警告阈值。
+      *
+-     * 超过 500KB 的都是第三方的**懒加载**负载：Shiki 的单个语言语法
+-     * （emacs-lisp、cpp、wolfram）、Mermaid 的图表引擎与 cytoscape 布局。
+-     * 它们各自独立成块，只有文档里真的出现对应语言或图表时才会被请求，
+-     * 完全不在首屏关键路径上——viewer 入口只有 84KB。
+-     * 默认阈值在这里给出的是误报，把它调到实际的量级，
+-     * 让警告重新变成「有东西不对」的信号。
++     * 超过阈值的分包分两类：一是第三方的**懒加载**负载（Shiki 的单个语言语法、
++     * Mermaid 的图表引擎与 cytoscape 布局），只有文档里真的出现对应语言或图表
++     * 时才会被请求；二是 viewer 入口本身——CodeMirror 是唯一的文档视图，
++     * 无法懒加载，入口因此在 350KB 量级。
++     *
++     * 这是本地扩展，资源从磁盘加载、零网络请求，这个量级不影响启动。
++     * 把阈值调到实际量级，让警告重新变成「有东西不对」的信号。
+      */
+     chunkSizeWarningLimit: 800,
+     rollupOptions: {
+       input: {
+         viewer: resolve(__dirname, 'viewer.html'),
+         popup: resolve(__dirname, 'popup.html'),
+         options: resolve(__dirname, 'options.html'),
+         background: resolve(__dirname, 'src/background/index.ts'),
+       },
+       output: {

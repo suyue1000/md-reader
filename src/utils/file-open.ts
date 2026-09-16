@@ -1,5 +1,6 @@
 import type { DocumentSource, MarkdownDocument } from '@/types';
 import { canUseFilePicker } from './env';
+import type { PermissionOutcome } from './handle-store';
 import { createLogger } from './logger';
 
 const log = createLogger('file-open');
@@ -245,4 +246,35 @@ export async function probeCurrentFile(knownLastModified: number): Promise<FileP
   if (file.lastModified === knownLastModified) return { kind: 'unchanged' };
 
   return { kind: 'changed', document: await fileToDocument(file, 'fs-handle', handle.name) };
+}
+
+/**
+ * 确认（并在允许时申请）文件的写权限。
+ *
+ * `requestPermission` **必须在用户手势的调用栈内**，而自动保存由定时器触发，
+ * 没有手势。因此写权限只有一个申请时机：用户点「编辑」的那一下。
+ * 这也是编辑态与阅读态必须分开的技术原因之一。
+ *
+ * 复用 `handle-store.ts` 的 `PermissionOutcome` 而不是另定义一个：调用方对
+ * 「文件写权限」与「目录读权限」的三种结果做的是同一套分支处理，两份形状
+ * 相同的类型只会让它们在将来悄悄分叉。
+ *
+ * @param interactive 为 true 时会弹出授权提示，调用点必须在用户手势内
+ */
+export async function ensureFileWritePermission(
+  handle: FileSystemFileHandle,
+  interactive: boolean,
+): Promise<PermissionOutcome> {
+  const descriptor = { mode: 'readwrite' } as const;
+  try {
+    const current = await handle.queryPermission?.(descriptor);
+    if (current === 'granted') return 'granted';
+    if (!interactive) return current === 'denied' ? 'denied' : 'prompt';
+
+    const next = await handle.requestPermission?.(descriptor);
+    return next === 'granted' ? 'granted' : next === 'denied' ? 'denied' : 'prompt';
+  } catch (error) {
+    log.warn('申请文件写权限失败', error);
+    return 'denied';
+  }
 }

@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import { AppShell } from '@/components/layout/AppShell';
+import { EditorViewProvider } from '@/editor/EditorContext';
 import { SearchBar } from '@/components/search/SearchBar';
 import { SettingsDrawer } from '@/components/settings/SettingsDrawer';
 import { ErrorBoundary } from '@/components/ui/ErrorBoundary';
@@ -52,10 +53,16 @@ export function App(): React.JSX.Element {
 
   return (
     <ErrorBoundary>
-      <AppShell>
-        <RouterOutlet routes={routes} fallback={<ReaderPage />} />
-      </AppShell>
-      <SearchBar />
+      {/* 编辑器实例的 provider 必须包住 AppShell：侧栏的目录要跳转，
+          正文的编辑器才是实例的来源，两者是 AppShell 里的兄弟子树。
+          查找条也在里面——它查的是编辑器里的源文本、跳转也要对 view 下指令，
+          留在 provider 之外的话 `useEditorView()` 永远是 null，查找会静默失效 */}
+      <EditorViewProvider>
+        <AppShell>
+          <RouterOutlet routes={routes} fallback={<ReaderPage />} />
+        </AppShell>
+        <SearchBar />
+      </EditorViewProvider>
       <SettingsDrawer />
       <Toast />
       {dragging && (

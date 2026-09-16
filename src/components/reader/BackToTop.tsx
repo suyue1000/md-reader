@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ArrowUp } from 'lucide-react';
 import { useScrollContainer } from '@/components/layout/ScrollContainerContext';
+import { useDocumentStore } from '@/stores/document.store';
 
 /** 滚过这个距离才显示按钮，避免刚翻一屏就冒出来挡内容 */
 const SHOW_THRESHOLD = 400;
@@ -45,7 +46,17 @@ export function BackToTop(): React.JSX.Element | null {
       type="button"
       aria-label="返回顶部"
       title="返回顶部"
-      onClick={() => container?.scrollTo({ top: 0, behavior: 'smooth' })}
+      /*
+       * 「回到顶部」是一次显式导航（判定标准见 store 的 `navigationEpoch`）：
+       * 用户点了按钮，落点由我们指定，视口真的被带走。不记的话，刚恢复过阅读
+       * 位置的文档里点它，增强完成后的校正会把用户从顶部拽回上次读到的地方。
+       * 平滑滚动派发的 `scroll` 事件迟于 `onEnhanced`，撤不了防。
+       */
+      onClick={() => {
+        if (!container) return;
+        useDocumentStore.getState().markNavigation();
+        container.scrollTo({ top: 0, behavior: 'smooth' });
+      }}
       className="no-print fixed bottom-10 right-8 z-40 flex h-9 w-9 items-center justify-center rounded-full transition-colors duration-[var(--app-duration)]"
       style={{
         background: 'var(--app-elevated)',

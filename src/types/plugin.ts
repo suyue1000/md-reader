@@ -16,6 +16,19 @@ export interface PluginContext {
   readonly settings: Settings;
   /** 请求宿主重新渲染当前文档（异步渲染完成后调用，如 Mermaid 出图） */
   requestRerender(): void;
+  /**
+   * 要求增强器**一次做完并等它做完**，不要按视口懒加载。
+   *
+   * 屏幕上的增强可以偷懒：代码块只给视口附近的上色，滚到了再算下一批
+   * （见 `code-block.ts` 的 IntersectionObserver）。导出和打印不行——
+   * 它们要对整篇文档做一次快照，而快照时刻由调用方决定，不由滚动决定。
+   * 懒加载的增强器在这个场合会交出一份「结构齐了但还没上色」的 DOM，
+   * 而且不会报任何错。
+   *
+   * 只有「按需推进」的增强器需要理会它；同步做完的增强器（Mermaid、图片）
+   * 本来就满足这个语义，可以忽略。不设置等同于 false。
+   */
+  readonly eager?: boolean;
 }
 
 /**

@@ -54,7 +54,7 @@ export async function saveFile(
   const picker = window.showSaveFilePicker;
   if (typeof picker !== 'function' || !canUseFilePicker()) {
     downloadViaAnchor(filename, blob);
-    return { status: 'done', filename, bytes: blob.size };
+    return { status: 'done', filename, bytes: blob.size, via: 'download' };
   }
 
   try {
@@ -65,13 +65,25 @@ export async function saveFile(
     const writable = await handle.createWritable();
     await writable.write(blob);
     await writable.close();
-    return { status: 'done', filename: handle.name, bytes: blob.size };
+    // 带上句柄：调用方（保存链路）能凭它把「另存」升格成「以后静默写回」，
+    // 见 ExportResult.handle 的说明。降级到 downloadViaAnchor 的分支没有
+    // 句柄可带，因此那两处返回值都不含这个字段。
+    return { status: 'done', filename: handle.name, bytes: blob.size, via: 'picker', handle };
   } catch (error) {
     if (isAbort(error)) return { status: 'cancelled' };
-    // 选择器被环境拒绝时不该让导出整个失败——退回浏览器下载依然能拿到文件
+    /*
+     * 选择器被环境拒绝时不该让导出整个失败——退回浏览器下载依然能拿到文件。
+     * 两种已知成因：接管页面里的阅读器是跨源 iframe（浏览器一律拒绝弹选择器），
+     * 以及**用户手势已经过期**（`Must be handling a user gesture to show a file
+     * picker`，见 `useExport` 里关于手势预算的那段）。
+     *
+     * 但结果必须标成 `download`：文件落在下载目录而不是用户挑的位置，
+     * 报成「已导出」会让人以为它在自己刚选的地方。后者正是手势超时唯一的
+     * 可见症状——不区分的话，这条降级是**完全静默**的。
+     */
     if (error instanceof DOMException && error.name === 'SecurityError') {
       downloadViaAnchor(filename, blob);
-      return { status: 'done', filename, bytes: blob.size };
+      return { status: 'done', filename, bytes: blob.size, via: 'download' };
     }
     return { status: 'error', message: error instanceof Error ? error.message : String(error) };
   }

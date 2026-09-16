@@ -1,0 +1,1181 @@
+# Review package: f5dad21..HEAD
+
+## Commits
+c776593 feat: 自动保存、脏状态与关页拦截
+
+## Files changed
+ src/components/layout/StatusBar.test.tsx           | 111 +++++++
+ src/components/layout/StatusBar.tsx                |  73 ++++-
+ src/components/settings/sections/EditorSection.tsx |   2 +-
+ src/editor/save.ts                                 |  10 +-
+ src/hooks/index.ts                                 |   1 +
+ src/hooks/unsaved-guard.test.tsx                   | 144 +++++++++
+ src/hooks/useAutoSave.test.tsx                     | 355 +++++++++++++++++++++
+ src/hooks/useAutoSave.ts                           | 253 +++++++++++++++
+ src/hooks/useEditMode.test.tsx                     |  12 +-
+ src/hooks/useEditMode.ts                           |  29 +-
+ src/hooks/useGlobalHotkeys.test.tsx                | 105 +++++-
+ src/hooks/useOpenFile.ts                           |   4 +
+ src/hooks/useToolbarActions.ts                     |  69 ++++
+ src/hooks/useWorkspace.ts                          |   4 +
+ src/stores/document.store.ts                       |  63 ++++
+ src/viewer/pages/ReaderPage.test.tsx               |  49 +++
+ src/viewer/pages/ReaderPage.tsx                    |  52 ++-
+ 17 files changed, 1299 insertions(+), 37 deletions(-)
+
+## Diff
+diff --git a/src/components/layout/StatusBar.test.tsx b/src/components/layout/StatusBar.test.tsx
+new file mode 100644
+index 0000000..37e1daa
+--- /dev/null
++++ b/src/components/layout/StatusBar.test.tsx
+@@ -0,0 +1,111 @@
++import { act, render, screen } from '@testing-library/react';
++import { afterEach, describe, expect, it } from 'vitest';
++import { useDocumentStore } from '@/stores/document.store';
++import type { MarkdownDocument } from '@/types';
++import { StatusBar } from './StatusBar';
++
++/**
++ * 状态栏是「写不回原文件」这个事实唯一的**常驻**出口。
++ *
++ * 进入编辑态拿不到写权限时会弹一条提示条，但它 2.6 秒后自动消失
++ * （`Toast` 的 info 时长），消失之后界面上原本再没有任何地方能看出这份文档
++ * 存不回去——工具栏按钮与已授权时长得一模一样，而用户会一直编辑下去。
++ * 这组用例锁的就是这条出口，以及保存状态的几种显示。
++ */
++
++const DOC: MarkdownDocument = {
++  id: 'doc:a.md',
++  name: 'a.md',
++  path: '/tmp/a.md',
++  content: '原文',
++  size: 6,
++  lastModified: 1000,
++  source: 'fs-handle',
++};
++
++function openDoc(): void {
++  act(() => {
++    useDocumentStore.getState().setDocument(DOC);
++  });
++}
++
++afterEach(() => {
++  act(() => {
++    useDocumentStore.getState().reset();
++  });
++});
++
++describe('StatusBar：写不回原文件的常驻提示', () => {
++  it('编辑态且没有写权限时一直显示', () => {
++    openDoc();
++    act(() => {
++      useDocumentStore.getState().setMode('edit');
++    });
++    render(<StatusBar />);
++
++    expect(screen.getByText(/无法写回原文件/)).toBeDefined();
++  });
++
++  it('拿到写权限后不再显示', () => {
++    openDoc();
++    act(() => {
++      useDocumentStore.getState().setMode('edit');
++      useDocumentStore.getState().setWritable(true);
++    });
++    render(<StatusBar />);
++
++    expect(screen.queryByText(/无法写回原文件/)).toBeNull();
++  });
++
++  it('阅读态不显示——那时还没向浏览器申请过写权限，报「无法写回」是不准确的', () => {
++    openDoc();
++    render(<StatusBar />);
++
++    expect(useDocumentStore.getState().writable).toBe(false);
++    expect(screen.queryByText(/无法写回原文件/)).toBeNull();
++  });
++});
++
++describe('StatusBar：保存状态', () => {
++  it('有未保存改动时显示未保存', () => {
++    openDoc();
++    act(() => {
++      useDocumentStore.getState().setDirty(true);
++    });
++    render(<StatusBar />);
++
++    expect(screen.getByText(/未保存/)).toBeDefined();
++  });
++
++  it('正在写盘时让位给「保存中」，不报未保存', () => {
++    openDoc();
++    act(() => {
++      useDocumentStore.getState().setDirty(true);
++      useDocumentStore.getState().setSaveStatus('saving');
++    });
++    render(<StatusBar />);
++
++    expect(screen.getByText('保存中…')).toBeDefined();
++    expect(screen.queryByText(/未保存/)).toBeNull();
++  });
++
++  it('保存成功显示已保存', () => {
++    openDoc();
++    act(() => {
++      useDocumentStore.getState().markSaved('新内容', 2000);
++    });
++    render(<StatusBar />);
++
++    expect(screen.getByText('已保存')).toBeDefined();
++  });
++
++  it('保存失败显示失败，并把原因放进 title', () => {
++    openDoc();
++    act(() => {
++      useDocumentStore.getState().setSaveStatus('error', '磁盘已满');
++    });
++    render(<StatusBar />);
++
++    expect(screen.getByText('保存失败').getAttribute('title')).toBe('磁盘已满');
++  });
++});
+diff --git a/src/components/layout/StatusBar.tsx b/src/components/layout/StatusBar.tsx
+index 1bad88c..0566036 100644
+--- a/src/components/layout/StatusBar.tsx
++++ b/src/components/layout/StatusBar.tsx
+@@ -1,14 +1,16 @@
++import { useMemo } from 'react';
+ import { AlertTriangle, Eye, PauseCircle } from 'lucide-react';
+ import { useDocumentStore } from '@/stores/document.store';
+ import { useSettingsStore } from '@/stores/settings.store';
+ import type { WatchStatus } from '@/types';
++import { formatCombo, isMacPlatform } from '@/utils/hotkeys';
+ 
+ /** 把字节数格式化为人类可读的大小 */
+ function formatSize(bytes: number): string {
+   if (bytes < 1024) return `${bytes} B`;
+   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+ }
+ 
+ /** 把时间戳格式化为「刚刚 / x 分钟前」 */
+ function formatRelativeTime(timestamp: number): string {
+@@ -46,27 +48,94 @@ function WatchIndicator(): React.JSX.Element | null {
+     >
+       <Icon size={11} />
+       {meta.text}
+       {watchStatus === 'watching' && lastRefreshedAt > 0 && (
+         <span>· 已更新 {formatRelativeTime(lastRefreshedAt)}</span>
+       )}
+     </span>
+   );
+ }
+ 
++/** 保存状态对应的文案。未保存用点而不是文字，避免和监听状态抢注意力 */
++const SAVE_META = {
++  idle: null,
++  saving: { text: '保存中…', tone: 'muted' },
++  saved: { text: '已保存', tone: 'muted' },
++  error: { text: '保存失败', tone: 'danger' },
++} as const;
++
++/** 保存状态指示 */
++function SaveIndicator(): React.JSX.Element | null {
++  const dirty = useDocumentStore((state) => state.dirty);
++  const saveStatus = useDocumentStore((state) => state.saveStatus);
++  const saveError = useDocumentStore((state) => state.saveError);
++
++  /*
++   * 脏状态优先于「已保存」这类历史状态显示，但让位给「保存中」——正在写盘
++   * 的那一刻内容确实还没落盘（dirty 仍为真），此时报「未保存」会让用户以为
++   * 什么都没发生，而事实是马上就好。
++   */
++  if (dirty && saveStatus !== 'saving') {
++    return <span title="改动还没有写回文件">● 未保存</span>;
++  }
++
++  const meta = SAVE_META[saveStatus];
++  if (!meta) return null;
++
++  return (
++    <span
++      style={{ color: meta.tone === 'danger' ? 'var(--app-danger)' : 'var(--app-text-subtle)' }}
++      title={saveError ?? undefined}
++    >
++      {meta.text}
++    </span>
++  );
++}
++
++/**
++ * 「写不回原文件」的常驻提示。
++ *
++ * 进入编辑态时若没拿到写权限，只会弹一条几秒后自动消失的提示条
++ * （`Toast` 的 info 停留 2.6 秒）。提示条消失之后，界面上原本再没有任何
++ * 地方能看出这份文档存不回去——工具栏的按钮与已授权时长得一模一样，
++ * 而用户会一直编辑下去。状态栏是这条信息的常驻出口。
++ *
++ * 只在编辑态显示：阅读态下 `writable` 为 false 是常态（写权限只在点「编辑」
++ * 的那一下申请），在那时报「无法写回」既没有意义，也是不准确的——那时根本
++ * 还没问过浏览器。
++ */
++function WriteTargetIndicator(): React.JSX.Element | null {
++  const mode = useDocumentStore((state) => state.mode);
++  const writable = useDocumentStore((state) => state.writable);
++  const hasDocument = useDocumentStore((state) => state.document !== null);
++  const saveHotkey = useMemo(() => formatCombo('mod+s', isMacPlatform()), []);
++
++  if (!hasDocument || mode !== 'edit' || writable) return null;
++
++  return (
++    <span
++      style={{ color: 'var(--app-warning)' }}
++      title="没有这个文件的写入权限，自动保存不会动它。手动保存会弹出另存对话框，把改动存成一份新文件"
++    >
++      <AlertTriangle size={11} className="mr-1 inline align-[-1px]" />
++      无法写回原文件，{saveHotkey} 另存
++    </span>
++  );
++}
++
+ /**
+  * 底部状态栏：展示当前文档的元信息、监听状态与关键设置。
+  *
+  * 曾经这里还常驻一个「渲染 xx ms」。它随分块渲染一起撤掉了：正文改由
+  * CodeMirror 按视口逐块渲染之后，「一次渲染的总耗时」这个量不再存在——
+  * 首屏只渲染看得见的几块，剩下的随滚动陆续补上，报任何一个数字都是
+- * 在误导人。右侧腾出的位置留给后续的保存状态。
++ * 在误导人。右侧腾出的位置现在归保存状态与「写不回原文件」的常驻提示。
+  */
+ export function StatusBar(): React.JSX.Element {
+   const doc = useDocumentStore((state) => state.document);
+   const status = useDocumentStore((state) => state.status);
+   const tocCount = useDocumentStore((state) => state.toc.length);
+   const contentWidth = useSettingsStore((state) => state.settings.appearance.contentWidth);
+ 
+   return (
+     <footer
+       className="no-print flex h-6 shrink-0 items-center gap-3 border-t px-3 text-[11px]"
+@@ -74,15 +143,17 @@ export function StatusBar(): React.JSX.Element {
+         borderColor: 'var(--app-border-subtle)',
+         background: 'var(--app-surface)',
+         color: 'var(--app-text-subtle)',
+       }}
+     >
+       <span className="truncate">{doc ? doc.path : '未打开文件'}</span>
+       {doc && <span>{formatSize(doc.size)}</span>}
+       {doc && tocCount > 0 && <span>{tocCount} 个顶级标题</span>}
+       <WatchIndicator />
+       <span className="flex-1" />
++      <WriteTargetIndicator />
++      <SaveIndicator />
+       <span>宽度 {contentWidth === 'full' ? '100%' : `${contentWidth}px`}</span>
+       <span>{status === 'loading' ? '加载中…' : status === 'error' ? '出错' : '就绪'}</span>
+     </footer>
+   );
+ }
+diff --git a/src/components/settings/sections/EditorSection.tsx b/src/components/settings/sections/EditorSection.tsx
+index 4421af0..24c7a91 100644
+--- a/src/components/settings/sections/EditorSection.tsx
++++ b/src/components/settings/sections/EditorSection.tsx
+@@ -6,21 +6,21 @@ import { SETTINGS_BOUNDS, type EditorSettings } from '@/types';
+ /** 布尔类编辑设置 */
+ const TOGGLES: ReadonlyArray<{
+   key: keyof Pick<EditorSettings, 'autoSave' | 'showLineNumbers' | 'indentWithTabs'>;
+   label: string;
+   description?: string;
+ }> = [
+   {
+     key: 'autoSave',
+     label: '自动保存',
+     description:
+-      '停笔后自动写回原文件。写入的是你磁盘上的真实文件，没有回收站——关掉它之后，改动需要你手动用「导出 Markdown」另存一份（原地保存的快捷键还未加入）。',
++      '停笔后自动写回原文件。写入的是你磁盘上的真实文件，没有回收站——关掉它之后，改动要靠你自己按 ⌘S / Ctrl+S（或工具栏的「保存」）写回。',
+   },
+   { key: 'showLineNumbers', label: '编辑态显示行号' },
+   { key: 'indentWithTabs', label: '用 Tab 缩进', description: '关闭时用空格，宽度由下方「缩进宽度」决定' },
+ ];
+ 
+ /** 默认打开模式选项 */
+ const MODE_OPTIONS: ReadonlyArray<{ value: EditorSettings['defaultMode']; label: string }> = [
+   { value: 'read', label: '阅读' },
+   { value: 'edit', label: '编辑' },
+ ];
+diff --git a/src/editor/save.ts b/src/editor/save.ts
+index 03e57c2..3598b44 100644
+--- a/src/editor/save.ts
++++ b/src/editor/save.ts
+@@ -55,45 +55,45 @@ export type SaveOutcome =
+   | { kind: 'cancelled' }
+   | { kind: 'denied' }
+   | { kind: 'error'; message: string };
+ 
+ /**
+  * 执行一次保存。
+  *
+  * @param text 要写入的文本，直接来自编辑器——**不做任何规整**。
+  *   导出 Markdown 时会走 `normalizeMarkdown` 整理空白，但那是「导出」这个
+  *   动作的一部分；保存是把用户的文件写回去，改动一个字符都是越界。
+- * @param automatic 是否由定时器触发。目前还没有定时器或 ⌘S 会调用这个
+- *   函数——那是 Task 17 的事——但决策与写入的正确性在这里先钉住。
++ * @param automatic 是否由定时器触发。两个调用方都在 `hooks/useAutoSave.ts`：
++ *   停笔后的防抖定时器传 true，⌘S 与工具栏的「保存」传 false。
+  */
+ export async function performSave(text: string, automatic: boolean): Promise<SaveOutcome> {
+   const state = useDocumentStore.getState();
+   const doc = state.document;
+   if (!doc) return { kind: 'skipped' };
+ 
+   const target = decideSaveTarget({
+     dirty: text !== doc.content,
+     handle: getCurrentFileHandle(),
+     writable: state.writable,
+     canUsePicker: canUseFilePicker(),
+     automatic,
+   });
+ 
+   switch (target.kind) {
+     case 'clean':
+       return { kind: 'skipped' };
+ 
+     case 'needs-permission': {
+       // decideSaveTarget 保证走到这里时 automatic 一定是 false（见
+-      // save-target.ts），也就是手动保存——目前还没有真实的触发入口
+-      // （快捷键要到 Task 17 才接上），但按约定手动保存只能由用户手势
+-      // 发起，因此这里可以放心调用需要手势的 requestPermission
++      // save-target.ts），也就是手动保存。手动保存的两个入口——⌘S 与工具栏
++      // 的「保存」按钮——都在用户手势的调用栈内（快捷键 handler 就是按钮的
++      // onSelect 本身），因此这里可以放心调用需要手势的 requestPermission
+       const outcome = await ensureFileWritePermission(target.handle, true);
+       if (outcome !== 'granted') return { kind: 'denied' };
+       useDocumentStore.getState().setWritable(true);
+       return writeThrough(target.handle, text, doc.content);
+     }
+ 
+     case 'write':
+       return writeThrough(target.handle, text, doc.content);
+ 
+     case 'save-as':
+diff --git a/src/hooks/index.ts b/src/hooks/index.ts
+index 1f57554..6841527 100644
+--- a/src/hooks/index.ts
++++ b/src/hooks/index.ts
+@@ -4,14 +4,15 @@ export * from './useCustomStyle';
+ export * from './useBootstrap';
+ export * from './useOpenFile';
+ export * from './useFileDrop';
+ export * from './useScrollSpy';
+ export * from './useFullscreen';
+ export * from './useHotkeys';
+ export * from './useGlobalHotkeys';
+ export * from './useToolbarActions';
+ export * from './useMediaQuery';
+ export * from './useAutoRefresh';
++export * from './useAutoSave';
+ export * from './useReadingPosition';
+ export * from './useWorkspace';
+ export * from './useRelativeLinks';
+ export * from './useExport';
+diff --git a/src/hooks/unsaved-guard.test.tsx b/src/hooks/unsaved-guard.test.tsx
+new file mode 100644
+index 0000000..de93d9d
+--- /dev/null
++++ b/src/hooks/unsaved-guard.test.tsx
+@@ -0,0 +1,144 @@
++import { useEffect } from 'react';
++import { act, render } from '@testing-library/react';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { useDocumentStore } from '@/stores/document.store';
++import type { MarkdownDocument } from '@/types';
++import { openMarkdownFile } from '@/utils/file-open';
++// 命名空间形式的类型导入，供下面的 `importOriginal` 标注原模块的形状
++// （项目禁止行内的 `import()` 类型标注，见 eslint 的 consistent-type-imports）
++import type * as FileOpenModule from '@/utils/file-open';
++import { useOpenFile } from './useOpenFile';
++import { useWorkspace } from './useWorkspace';
++
++/**
++ * 「有未保存改动时切换文档要先问一句」这条规则有两个调用点：工具栏的
++ * 「打开文件」（`useOpenFile.open`）与文件树里点另一篇（`useWorkspace.openPath`）。
++ *
++ * 这个文件按**规则**而不是按模块组织，是刻意的：规则只有一条，而漏接的方式
++ * 有两种，分成两个文件写反而容易只测到自己记得的那一个调用点。切换一旦发生
++ * 就是不可逆的——旧文档连同它没保存的改动一起被顶掉，版本缓冲里也不会留下
++ * 任何东西（那只在写盘前入栈）。
++ */
++
++vi.mock('@/utils/file-open', async (importOriginal) => {
++  const actual = await importOriginal<typeof FileOpenModule>();
++  return { ...actual, openMarkdownFile: vi.fn() };
++});
++
++const openMock = vi.mocked(openMarkdownFile);
++
++const DOC: MarkdownDocument = {
++  id: 'doc:a.md',
++  name: 'a.md',
++  path: 'a.md',
++  content: '原文',
++  size: 6,
++  lastModified: 1000,
++  source: 'fs-handle',
++};
++
++const OTHER: MarkdownDocument = { ...DOC, id: 'doc:b.md', name: 'b.md', path: 'b.md' };
++
++const actions: {
++  open: (() => Promise<void>) | null;
++  openPath: ((path: string) => Promise<void>) | null;
++} = { open: null, openPath: null };
++
++function Probe(): React.JSX.Element {
++  const { open } = useOpenFile();
++  const { openPath } = useWorkspace();
++  useEffect(() => {
++    actions.open = open;
++    actions.openPath = openPath;
++  });
++  return <div />;
++}
++
++/** 打开一份文档并把它标成「有未保存改动」 */
++function openDirtyDoc(): void {
++  act(() => {
++    useDocumentStore.getState().setDocument(DOC);
++    useDocumentStore.getState().setMode('edit');
++    useDocumentStore.getState().setDirty(true);
++  });
++}
++
++beforeEach(() => {
++  openMock.mockReset();
++  openMock.mockResolvedValue(OTHER);
++  render(<Probe />);
++});
++
++afterEach(() => {
++  act(() => {
++    useDocumentStore.getState().reset();
++  });
++  vi.restoreAllMocks();
++});
++
++describe('切换文档前的未保存确认', () => {
++  it('「打开文件」：用户选择留下时不打开新文件，连选择器都不弹', async () => {
++    openDirtyDoc();
++    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
++
++    await act(async () => {
++      await actions.open?.();
++    });
++
++    expect(confirm).toHaveBeenCalledTimes(1);
++    // 选择器都没弹：问在打开之前，而不是打开之后才补一句
++    expect(openMock).not.toHaveBeenCalled();
++    expect(useDocumentStore.getState().document?.path).toBe('a.md');
++  });
++
++  it('「打开文件」：确认丢弃后照常打开', async () => {
++    openDirtyDoc();
++    vi.spyOn(window, 'confirm').mockReturnValue(true);
++
++    await act(async () => {
++      await actions.open?.();
++    });
++
++    expect(useDocumentStore.getState().document?.path).toBe('b.md');
++  });
++
++  it('「打开文件」：没有未保存改动时不打扰用户', async () => {
++    act(() => {
++      useDocumentStore.getState().setDocument(DOC);
++    });
++    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
++
++    await act(async () => {
++      await actions.open?.();
++    });
++
++    expect(confirm).not.toHaveBeenCalled();
++    expect(useDocumentStore.getState().document?.path).toBe('b.md');
++  });
++
++  it('文件树切换：用户选择留下时原地不动，也不报错', async () => {
++    openDirtyDoc();
++    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
++
++    await act(async () => {
++      await actions.openPath?.('别的文档.md');
++    });
++
++    expect(confirm).toHaveBeenCalledTimes(1);
++    expect(useDocumentStore.getState().document?.path).toBe('a.md');
++    expect(useDocumentStore.getState().status).toBe('ready');
++    expect(useDocumentStore.getState().error).toBeNull();
++  });
++
++  it('文件树切换：确认丢弃后继续往下走（这里因为没有句柄而以报错收场）', async () => {
++    openDirtyDoc();
++    vi.spyOn(window, 'confirm').mockReturnValue(true);
++
++    await act(async () => {
++      await actions.openPath?.('别的文档.md');
++    });
++
++    // 走到了真正的打开逻辑：工作区里没有这个路径的句柄，如实报错
++    expect(useDocumentStore.getState().error).toContain('别的文档.md');
++  });
++});
+diff --git a/src/hooks/useAutoSave.test.tsx b/src/hooks/useAutoSave.test.tsx
+new file mode 100644
+index 0000000..f3a8550
+--- /dev/null
++++ b/src/hooks/useAutoSave.test.tsx
+@@ -0,0 +1,355 @@
++import { useEffect } from 'react';
++import { EditorState } from '@codemirror/state';
++import { EditorView } from '@codemirror/view';
++import { act, render, waitFor } from '@testing-library/react';
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { EditorViewProvider, useSetEditorView } from '@/editor/EditorContext';
++import { popPreviousVersion } from '@/editor/save';
++import { clearSelfWrites } from '@/editor/self-write';
++import { useDocumentStore } from '@/stores/document.store';
++import { useSettingsStore } from '@/stores/settings.store';
++import { useUiStore } from '@/stores/ui.store';
++import type { MarkdownDocument } from '@/types';
++import { probeCurrentFile, setCurrentFileHandle, type FileProbeResult } from '@/utils/file-open';
++// 命名空间形式的类型导入，供下面的 `importOriginal` 标注原模块的形状
++// （项目禁止行内的 `import()` 类型标注，见 eslint 的 consistent-type-imports）
++import type * as FileOpenModule from '@/utils/file-open';
++import { useAutoRefresh } from './useAutoRefresh';
++import { useAutoSave, useSaveCommands } from './useAutoSave';
++
++/**
++ * 这是整条保存链路第一次被接上真实的触发入口。Task 14/15/16 交付的决策、
++ * 写盘与冲突判定各自都有单测，但**没有任何一条用例证明它们会被调用**——
++ * 「按了 ⌘S 什么都没发生」「停笔之后没写盘」这类断线在那些用例里全是绿的。
++ * 本文件测的就是这段接线。
++ *
++ * 只 mock `probeCurrentFile` 一个函数（它背后是真实的 File System Access
++ * API，jsdom 里造不出来），`file-open` 的其余部分——尤其是模块作用域的
++ * 当前句柄——保持真实，否则 `save.ts` 会拿不到句柄，测的就不是同一条链路了。
++ */
++vi.mock('@/utils/file-open', async (importOriginal) => {
++  const actual = await importOriginal<typeof FileOpenModule>();
++  return { ...actual, probeCurrentFile: vi.fn() };
++});
++
++const probeMock = vi.mocked(probeCurrentFile);
++
++const DOC: MarkdownDocument = {
++  id: 'doc:a.md',
++  name: 'a.md',
++  path: 'a.md',
++  content: '原文',
++  size: 6,
++  lastModified: 1000,
++  source: 'fs-handle',
++};
++
++const AUTO_SAVE_DELAY_MS = 800;
++const REFRESH_INTERVAL_MS = 1500;
++
++/**
++ * 能记下写入内容、并像真实文件一样在每次写入后推进 mtime 的句柄替身。
++ *
++ * 与 `editor/save.test.ts` 里那个是同一套形状（那里也解释了为什么用替身而
++ * 不是真实句柄）。这里另写一份而不是抽公共件：两边关心的字段不同，绑在一起
++ * 之后任何一边加字段都会牵动另一边。
++ */
++function fakeHandle(): { handle: FileSystemFileHandle; writes: string[]; lastModified: () => number } {
++  const writes: string[] = [];
++  let lastModified = DOC.lastModified;
++  let pending = '';
++  const handle = {
++    name: 'a.md',
++    queryPermission: () => Promise.resolve('granted' as PermissionState),
++    requestPermission: () => Promise.resolve('granted' as PermissionState),
++    createWritable: () =>
++      Promise.resolve({
++        write: (text: string) => {
++          pending = text;
++          return Promise.resolve();
++        },
++        close: () => {
++          writes.push(pending);
++          lastModified += 1;
++          return Promise.resolve();
++        },
++      }),
++    getFile: () => Promise.resolve({ lastModified } as File),
++  };
++  return {
++    handle: handle as unknown as FileSystemFileHandle,
++    writes,
++    lastModified: () => lastModified,
++  };
++}
++
++/** 把一个真实的 EditorView 交给 provider；必须挂到 body，`useEditorView` 按 isConnected 判活 */
++function WithView({ doc, children }: { doc: string; children: React.ReactNode }): React.JSX.Element {
++  const setView = useSetEditorView();
++  useEffect(() => {
++    const view = new EditorView({ state: EditorState.create({ doc }), parent: document.body });
++    setView(view);
++    return () => {
++      view.destroy();
++    };
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, []);
++  return <>{children}</>;
++}
++
++/** 把两个 hook 的返回值交给用例；在 effect 里写，渲染期改外部变量是 React 禁止的 */
++const commands: { current: ReturnType<typeof useSaveCommands> | null } = { current: null };
++
++function Probe({ text, watch = false }: { text: string; watch?: boolean }): React.JSX.Element {
++  useAutoSave(text);
++  // 只有验「保存后会不会被误判成冲突」的那条用例需要轮询一起跑
++  useAutoRefresh();
++  const value = useSaveCommands();
++  useEffect(() => {
++    commands.current = value;
++  });
++  return <div data-watching={String(watch)} />;
++}
++
++/** 挂一个内容与 `text` 相同的真实编辑器——冲突判定要读它 */
++function mount(text: string, editorDoc = text): void {
++  render(
++    <EditorViewProvider>
++      <WithView doc={editorDoc}>
++        <Probe text={text} />
++      </WithView>
++    </EditorViewProvider>,
++  );
++}
++
++/** 开一份处于编辑态、已授权、句柄就位的文档 */
++function openWritableDoc(handle: FileSystemFileHandle): void {
++  setCurrentFileHandle(handle);
++  act(() => {
++    useDocumentStore.getState().setDocument(DOC);
++    useDocumentStore.getState().setWritable(true);
++    useDocumentStore.getState().setMode('edit');
++  });
++}
++
++beforeEach(() => {
++  probeMock.mockReset();
++  probeMock.mockResolvedValue({ kind: 'unchanged' });
++  clearSelfWrites();
++  commands.current = null;
++  act(() => {
++    useSettingsStore
++      .getState()
++      .setEditor({ autoSave: true, autoSaveDelay: AUTO_SAVE_DELAY_MS, keepVersions: 5 });
++  });
++});
++
++afterEach(() => {
++  act(() => {
++    useDocumentStore.getState().reset();
++    useUiStore.getState().dismissNotice();
++    useSettingsStore.getState().setEditor({ autoSave: true, autoSaveDelay: AUTO_SAVE_DELAY_MS });
++  });
++  setCurrentFileHandle(null);
++  clearSelfWrites();
++  document.body.replaceChildren();
++  while (popPreviousVersion() !== null) {
++    /* 排空版本缓冲，避免用例互相污染 */
++  }
++  vi.useRealTimers();
++});
++
++/** 推进 `ms` 毫秒并让链路上的 await 全部落定 */
++async function advance(ms: number): Promise<void> {
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(ms);
++  });
++}
++
++describe('useAutoSave：停笔后自动写回', () => {
++  it('停笔到点后把编辑器里的文本写回文件', async () => {
++    vi.useFakeTimers();
++    const { handle, writes } = fakeHandle();
++    openWritableDoc(handle);
++    mount('改过的内容');
++
++    // 还没到点，一个字节都不该落盘
++    await advance(AUTO_SAVE_DELAY_MS - 100);
++    expect(writes).toEqual([]);
++
++    await advance(200);
++
++    // 删掉 useAutoSave 里那句 scheduleSave()，这条会变红
++    expect(writes).toEqual(['改过的内容']);
++  });
++
++  it('保存成功后把 document.content 推进到刚写下去的那份，脏状态归零', async () => {
++    vi.useFakeTimers();
++    const { handle, lastModified } = fakeHandle();
++    openWritableDoc(handle);
++    mount('改过的内容');
++    await advance(AUTO_SAVE_DELAY_MS);
++
++    const state = useDocumentStore.getState();
++    // 删掉 runSave 里的 markSaved 调用，下面四条一起变红
++    expect(state.document?.content).toBe('改过的内容');
++    expect(state.document?.lastModified).toBe(lastModified());
++    expect(state.dirty).toBe(false);
++    expect(state.saveStatus).toBe('saved');
++  });
++
++  it('保存之后不会被自动刷新误判成冲突', async () => {
++    /*
++     * 保存把磁盘上的 mtime 改了，下一轮轮询因此一定会看到「文件变了」。
++     * 挡住它的一共有三道网，这里把前两道都拆掉，只留 markSaved 那一道：
++     *
++     * 1. 时间戳比对（`probeCurrentFile` 发现 mtime 没变就直接返回 unchanged）
++     *    ——这里 mock 掉探测，强制报告 changed；
++     * 2. 自写登记表（`self-write.ts` 只留最近 12 条，连续保存会把旧条目挤出去）
++     *    ——这里 `clearSelfWrites()` 模拟它已经滚过；
++     * 3. `markSaved` 把 `document.content` 推进到刚写下去的那份，于是
++     *    `decideRefresh` 看到磁盘内容与「上次落盘内容」一致，只对时。
++     *
++     * 第 3 道断掉时，`savedContent` 还停在「原文」，而编辑器里是「改过的
++     * 内容」——`decideRefresh` 判定为本地有未保存改动 + 外部改动 = 冲突，
++     * 用户每保存一次就被弹一条「文件在编辑器之外被修改了」。
++     */
++    vi.useFakeTimers();
++    const { handle, lastModified } = fakeHandle();
++    openWritableDoc(handle);
++    mount('改过的内容');
++
++    await advance(AUTO_SAVE_DELAY_MS);
++    expect(useDocumentStore.getState().document?.content).toBe('改过的内容');
++
++    clearSelfWrites();
++    const changed: FileProbeResult = {
++      kind: 'changed',
++      document: { ...DOC, content: '改过的内容', lastModified: lastModified() },
++    };
++    probeMock.mockResolvedValue(changed);
++    await advance(REFRESH_INTERVAL_MS);
++
++    expect(useDocumentStore.getState().conflict).toBeNull();
++    expect(useDocumentStore.getState().document?.content).toBe('改过的内容');
++  });
++
++  it('阅读态不自动保存', async () => {
++    vi.useFakeTimers();
++    const { handle, writes } = fakeHandle();
++    setCurrentFileHandle(handle);
++    act(() => {
++      useDocumentStore.getState().setDocument(DOC);
++      useDocumentStore.getState().setWritable(true);
++    });
++    mount('改过的内容');
++
++    await advance(AUTO_SAVE_DELAY_MS * 2);
++
++    expect(writes).toEqual([]);
++  });
++
++  it('关掉自动保存后定时器不再写盘，手动保存照旧', async () => {
++    vi.useFakeTimers();
++    const { handle, writes } = fakeHandle();
++    act(() => {
++      useSettingsStore.getState().setEditor({ autoSave: false });
++    });
++    openWritableDoc(handle);
++    mount('改过的内容');
++
++    await advance(AUTO_SAVE_DELAY_MS * 2);
++    expect(writes).toEqual([]);
++
++    await act(async () => {
++      await commands.current?.saveNow();
++    });
++    expect(writes).toEqual(['改过的内容']);
++  });
++
++  it('没有写权限时自动保存静默跳过，不弹任何对话框', async () => {
++    vi.useFakeTimers();
++    const { handle, writes } = fakeHandle();
++    const picker = vi.fn();
++    (window as { showSaveFilePicker?: unknown }).showSaveFilePicker = picker;
++    setCurrentFileHandle(handle);
++    act(() => {
++      useDocumentStore.getState().setDocument(DOC); // writable 默认 false
++      useDocumentStore.getState().setMode('edit');
++    });
++    mount('改过的内容');
++
++    // 连着过好几个防抖周期：这里正是「每 800ms 弹一次对话框」会暴露的地方
++    await advance(AUTO_SAVE_DELAY_MS * 4);
++
++    expect(writes).toEqual([]);
++    expect(picker).not.toHaveBeenCalled();
++    expect(useUiStore.getState().notice).toBeNull();
++    delete (window as { showSaveFilePicker?: unknown }).showSaveFilePicker;
++  });
++});
++
++describe('useAutoSave：关页拦截', () => {
++  /** 派发一次 beforeunload，返回浏览器会不会因此弹确认 */
++  function closeIntercepted(): boolean {
++    const event = new Event('beforeunload', { cancelable: true });
++    window.dispatchEvent(event);
++    return event.defaultPrevented;
++  }
++
++  it('有未保存改动时拦下关页', () => {
++    const { handle } = fakeHandle();
++    openWritableDoc(handle);
++    mount('改过的内容');
++
++    expect(useDocumentStore.getState().dirty).toBe(true);
++    // 删掉 beforeunload 那个 effect，这条变红
++    expect(closeIntercepted()).toBe(true);
++  });
++
++  it('没有未保存改动时不打扰用户', () => {
++    const { handle } = fakeHandle();
++    openWritableDoc(handle);
++    mount(DOC.content);
++
++    expect(useDocumentStore.getState().dirty).toBe(false);
++    expect(closeIntercepted()).toBe(false);
++  });
++});
++
++describe('useSaveCommands：回到上一个保存版本', () => {
++  it('把上一个保存前的版本灌回编辑器', async () => {
++    const { handle } = fakeHandle();
++    openWritableDoc(handle);
++    mount('改过的内容');
++
++    // 先真的保存一次，版本缓冲里才会有「保存前」的那一版
++    await act(async () => {
++      await commands.current?.saveNow();
++    });
++    expect(useDocumentStore.getState().document?.content).toBe('改过的内容');
++
++    act(() => {
++      commands.current?.restorePreviousVersion();
++    });
++
++    await waitFor(() => {
++      expect(useUiStore.getState().notice?.text).toContain('上一个保存版本');
++    });
++    // 编辑器里回到了保存前的原文
++    const content = document.querySelector('.cm-content')?.textContent;
++    expect(content).toBe(DOC.content);
++  });
++
++  it('没有更早的版本时如实说明，而不是静默无反应', () => {
++    const { handle } = fakeHandle();
++    openWritableDoc(handle);
++    mount('改过的内容');
++
++    act(() => {
++      commands.current?.restorePreviousVersion();
++    });
++
++    expect(useUiStore.getState().notice?.text).toContain('没有更早的版本');
++  });
++});
+diff --git a/src/hooks/useAutoSave.ts b/src/hooks/useAutoSave.ts
+new file mode 100644
+index 0000000..95675ed
+--- /dev/null
++++ b/src/hooks/useAutoSave.ts
+@@ -0,0 +1,253 @@
++import { useCallback, useEffect, useRef } from 'react';
++import { useEditorView } from '@/editor/EditorContext';
++import { performSave, popPreviousVersion } from '@/editor/save';
++import { useDocumentStore } from '@/stores/document.store';
++import { useSettingsStore } from '@/stores/settings.store';
++import { useUiStore, type Notice } from '@/stores/ui.store';
++import { debounce, type Debounced } from '@/utils/fn';
++
++/** 弹一条瞬时提示，签名与 `useUiStore.showNotice` 一致 */
++type ShowNotice = (text: string, tone?: Notice['tone']) => void;
++
++/**
++ * 编辑器里此刻的正文；null 表示当前没有挂载中的阅读页。
++ *
++ * 为什么必须放在模块作用域，而不是靠 `useEditorView()` 现取：
++ * `useGlobalHotkeys()` 是在 `App` 的**组件体**里调用的，而
++ * `EditorViewProvider` 是 `App` 渲染出来的子树（见 `viewer/App.tsx`）——
++ * 组件体读到的是 provider 之外的默认值，恒为 null。⌘S 的 handler 正是从
++ * 那条路来的，靠 view 取文本会拿到 `document.content`（上次落盘的那份），
++ * 于是 `decideSaveTarget` 判成 clean，**按 ⌘S 什么都不会发生**。
++ *
++ * 只由下面 `useAutoSave` 的那一个实例写入（它跟着编辑器挂在 `ReaderPage`
++ * 上，全应用只有一份），卸载时置回 null。
++ */
++let draftText: string | null = null;
++
++/**
++ * 执行一次保存并把结果翻译成界面反馈。
++ *
++ * 自动与手动两条路只差一个 `automatic` 标志——它决定「写不回原文件」时是
++ * 弹对话框还是安静地什么都不做。这个分支在 `decideSaveTarget` 那个纯函数
++ * 里，这里不重写第二套。
++ */
++async function runSave(text: string, automatic: boolean, showNotice: ShowNotice): Promise<void> {
++  useDocumentStore.getState().setSaveStatus('saving');
++  const outcome = await performSave(text, automatic);
++  // 重新取一次 state：上面 await 期间 store 可能已经换了文档
++  const store = useDocumentStore.getState();
++
++  switch (outcome.kind) {
++    case 'saved':
++      store.markSaved(text, outcome.lastModified);
++      break;
++
++    case 'saved-as':
++      /*
++       * 另存没有可信的 mtime 可用：新文件的时间戳要再读一次磁盘才知道，而
++       * `saveFile` 只回传句柄。用 Date.now() 顶上是安全的——它只会让下一次
++       * 轮询的时间戳比对判成「变了」，于是多读一次内容，发现与
++       * `document.content` 一致（刚被 markSaved 推进），走 touch-timestamp
++       * 对时收场，不会重渲染、更不会误判冲突。
++       */
++      store.markSaved(text, Date.now());
++      showNotice(`已另存为 ${outcome.filename}`);
++      break;
++
++    case 'denied':
++      store.setSaveStatus('error', '未获得写入权限');
++      showNotice('未获得写入权限，改动尚未保存', 'error');
++      break;
++
++    case 'error':
++      store.setSaveStatus('error', outcome.message);
++      showNotice(`保存失败：${outcome.message}`, 'error');
++      break;
++
++    case 'cancelled':
++    case 'skipped':
++      // 用户自己取消的另存、以及「没改动 / 自动保存写不回去」这类无事发生，
++      // 都不该在状态栏留下红字
++      store.setSaveStatus('idle');
++      break;
++  }
++}
++
++/**
++ * 自动保存、脏状态与关页拦截。
++ *
++ * **必须只挂在一个地方**（目前是 `ReaderPage`，全应用只有一份实例）。挂第二
++ * 份的后果是两个防抖定时器对同一份文本各存一次盘、两个 `beforeunload` 监听
++ * 各拦一次——这与 `useApplyDefaultMode` 不并进 `useEditMode` 是同一条理由。
++ * 工具栏与快捷键要的是「立刻存一次」，走下面的 `useSaveCommands`，那个
++ * 不排定时器，可以有多份实例。
++ *
++ * @param text 编辑器里此刻的正文（由 `ReaderPage` 的 state 持有）
++ */
++export function useAutoSave(text: string): { saveNow: () => Promise<void> } {
++  const mode = useDocumentStore((state) => state.mode);
++  /**
++   * 上次与磁盘一致的内容。
++   *
++   * 订阅它而不是在 effect 里用 `getState()` 现取：保存成功后 `markSaved` 会
++   * 推进它，此时 `text` 没变，只有把它放进依赖数组，这个 effect 才会重跑一次
++   * 把脏状态算准——用户在写盘那几十毫秒里又敲了几个字的话，这一次重算正是
++   * 把「其实还脏着」纠回来的地方。
++   */
++  const savedContent = useDocumentStore((state) => state.document?.content ?? '');
++  const enabled = useSettingsStore((state) => state.settings.editor.autoSave);
++  const delay = useSettingsStore((state) => state.settings.editor.autoSaveDelay);
++  const showNotice = useUiStore((state) => state.showNotice);
++
++  /** 防抖到点时才读的文本；用 ref 是为了不让每个字符都重建定时器 */
++  const textRef = useRef(text);
++  /** 当前的防抖器，由下面第一个 effect 装填 */
++  const scheduleRef = useRef<Debounced<[]> | null>(null);
++
++  const run = useCallback(
++    (automatic: boolean) => runSave(textRef.current, automatic, showNotice),
++    [showNotice],
++  );
++
++  /*
++   * 防抖器在 effect 里建，不在渲染期。
++   *
++   * 渲染期建的话，这个闭包会在渲染过程中就捕获 `textRef`，而 ref 的值本就
++   * 「不参与渲染」——React 的 lint 规则（react-hooks/refs）会拦下这种写法，
++   * 理由是它无法确定这个函数会不会在渲染期间就被调用。放进 effect 之后，
++   * 创建与调用都发生在提交之后，这层不确定性不存在。
++   *
++   * 声明顺序有讲究：它必须排在下面那个排期的 effect **之前**——同一次提交里
++   * effect 按声明顺序执行，反过来的话第一次渲染就会拿着空的 scheduleRef 排期，
++   * 于是打开文档后的第一次改动永远等不到自动保存。
++   */
++  useEffect(() => {
++    const scheduled = debounce(() => void run(true), delay);
++    scheduleRef.current = scheduled;
++    // 改了防抖间隔（换一个防抖器）或页面卸载时，取消还没到点的那次自动保存：
++    // 它手里攥着的文本已经不是当前这一份了
++    return () => {
++      scheduled.cancel();
++      scheduleRef.current = null;
++    };
++  }, [run, delay]);
++
++  useEffect(() => {
++    /*
++     * 在 effect 里同步 ref 而不是渲染期直接赋值：渲染期写 ref 在并发渲染下
++     * 可能被执行多次或被丢弃，React 明确不推荐（同一约束见 `useHotkeys`）。
++     * 定时器回调不会在提交阶段插进来，所以「先同步、后排期」的顺序是安全的。
++     */
++    textRef.current = text;
++    draftText = text;
++
++    const dirty = text !== savedContent;
++    useDocumentStore.getState().setDirty(dirty);
++    // 自动保存只在编辑态排期：阅读态下这两份内容本来就应该相等，真不相等
++    // 也轮不到定时器替用户决定要不要写盘
++    if (mode === 'edit' && enabled && dirty) scheduleRef.current?.();
++  }, [text, savedContent, mode, enabled]);
++
++  useEffect(
++    () => () => {
++      draftText = null;
++    },
++    [],
++  );
++
++  /*
++   * 有未保存改动时拦截关页。
++   *
++   * 浏览器只允许显示它自己的固定文案（Chrome 早已忽略 returnValue 的内容），
++   * 因此这里不必也无法自定义提示内容；`preventDefault()` 与 `returnValue`
++   * 都写上是为了覆盖新旧两套规范。
++   *
++   * 监听无条件注册、条件判在 handler 里：按 dirty 装卸监听会让「刚变脏的
++   * 那一瞬间」落在两次 effect 之间，而用户恰恰最可能在改完之后立刻关页。
++   */
++  useEffect(() => {
++    const handler = (event: BeforeUnloadEvent): void => {
++      if (!useDocumentStore.getState().dirty) return;
++      event.preventDefault();
++      event.returnValue = '';
++    };
++    window.addEventListener('beforeunload', handler);
++    return () => {
++      window.removeEventListener('beforeunload', handler);
++    };
++  }, []);
++
++  const saveNow = useCallback(() => run(false), [run]);
++  return { saveNow };
++}
++
++/** 工具栏与快捷键用的即时保存命令 */
++export interface SaveCommands {
++  /** 立刻保存一次（⌘S 与工具栏按钮调用，处在用户手势内） */
++  saveNow: () => Promise<void>;
++  /** 把编辑器退回上一个保存前的版本 */
++  restorePreviousVersion: () => void;
++}
++
++/**
++ * 保存相关的即时命令。
++ *
++ * 与 `useAutoSave` 分开，是因为这个 hook 会被实例化多次（工具栏一份、
++ * `useGlobalHotkeys` 一份，两者都经由 `useToolbarActions`）：它只在被点到时
++ * 做事，不排定时器、不挂 `beforeunload`，多份实例无害。
++ */
++export function useSaveCommands(): SaveCommands {
++  const showNotice = useUiStore((state) => state.showNotice);
++  /**
++   * 编辑器实例，只给「回到上一个版本」用——它要把文本写回编辑器。
++   *
++   * 这里能拿到 view 的只有工具栏那一份实例（工具栏在 `EditorViewProvider`
++   * 里），快捷键那一份恒为 null（理由见本文件顶部 `draftText`）。这个动作
++   * 没有快捷键、只从工具栏菜单发起，所以够用；拿不到时如实提示而不是静默。
++   */
++  const view = useEditorView();
++
++  const saveNow = useCallback(async () => {
++    // 取模块里那份草稿而不是 store 里的 `document.content`：后者是上次落盘的
++    // 内容，用它保存等于永远在存一份没有改动的文本
++    const text = draftText ?? useDocumentStore.getState().document?.content ?? '';
++    await runSave(text, false, showNotice);
++  }, [showNotice]);
++
++  const restorePreviousVersion = useCallback(() => {
++    if (!view) {
++      showNotice('编辑器还没就绪，稍后再试', 'error');
++      return;
++    }
++    const previous = popPreviousVersion();
++    if (previous === null) {
++      showNotice('没有更早的版本了');
++      return;
++    }
++    /*
++     * 直接 dispatch 进编辑器，而不是去改 `ReaderPage` 的 state：这是一次
++     * 真实的文档改动，走 dispatch 才会进撤销栈、才会触发 `onChange` 把脏
++     * 状态与下一次自动保存一并带起来。
++     *
++     * 被换掉的那份（较新的）内容不会就此消失：下一次自动保存写盘前，
++     * `writeThrough` 会把当时的 `document.content`——也就是它——推进版本
++     * 缓冲，于是「再回去一次」仍然有得可退。
++     */
++    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: previous } });
++    showNotice('已回到上一个保存版本');
++  }, [view, showNotice]);
++
++  return { saveNow, restorePreviousVersion };
++}
++
++/**
++ * 切换文档前确认丢弃未保存的改动；返回 false 表示用户选择留下。
++ *
++ * 用 `window.confirm` 而不是现成的 Toast：Toast 做不到阻塞式确认，而这里
++ * 必须在「旧文档被顶掉」之前拿到用户的答复——问完再问后果就已经发生了。
++ * 这是全应用唯一一处真的需要阻塞用户的地方。
++ */
++export function confirmDiscardUnsaved(): boolean {
++  if (!useDocumentStore.getState().dirty) return true;
++  return window.confirm('当前文档有未保存的改动，切换后这些改动会丢失。确定要切换吗？');
++}
+diff --git a/src/hooks/useEditMode.test.tsx b/src/hooks/useEditMode.test.tsx
+index d6d74b1..6f9b0dc 100644
+--- a/src/hooks/useEditMode.test.tsx
++++ b/src/hooks/useEditMode.test.tsx
+@@ -68,30 +68,38 @@ describe('useEditMode', () => {
+     render(<Probe />);
+ 
+     await enterEdit();
+ 
+     // 这是整条保存链路上唯一一次能申请写权限的机会，它必须真的发生
+     expect(requests()).toBe(1);
+     expect(useDocumentStore.getState().writable).toBe(true);
+     expect(useDocumentStore.getState().mode).toBe('edit');
+   });
+ 
+-  it('权限被拒仍然进入编辑态，只是 writable 为 false 并提示改用另存', async () => {
++  it('权限被拒仍然进入编辑态，只是 writable 为 false 并说明按 ⌘S 会再申请一次', async () => {
+     const { handle } = permissionHandle('prompt', 'denied');
+     setCurrentFileHandle(handle);
+     render(<Probe />);
+ 
+     await enterEdit();
+ 
+     expect(useDocumentStore.getState().mode).toBe('edit');
+     expect(useDocumentStore.getState().writable).toBe(false);
+-    expect(useUiStore.getState().notice?.text).toContain('另存');
++    /*
++     * 文案锁的是一条**现在真的兑现得了**的承诺：手动保存握着句柄时会走
++     * `performSave` 的 needs-permission 分支，在按键这个用户手势里补发一次
++     * `requestPermission`。⌘S 接上之前这里只能让用户去「导出 Markdown」，
++     * 那句旧文案随之作废（见 `useEditMode` 的说明）。

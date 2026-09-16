@@ -4,7 +4,7 @@
  * 约定：
  * - 所有设置项都必须有默认值，读取时以 `DEFAULT_SETTINGS` 做深度兜底，
  *   这样新增字段不会让老用户的存量配置报错。
- * - 设置对象是扁平分组（appearance / markdown / reading / advanced），
+ * - 设置对象是扁平分组（appearance / markdown / reading / advanced / editor），
  *   与设置面板的分组一一对应，便于按组重置。
  */
 
@@ -118,18 +118,50 @@ export interface AdvancedSettings {
   takeoverMarkdownPages: boolean;
 }
 
+/** 编辑设置 */
+export interface EditorSettings {
+  /** 停笔后自动写回文件 */
+  autoSave: boolean;
+  /** 自动保存的防抖间隔（毫秒） */
+  autoSaveDelay: number;
+  /** 打开文档时的初始模式 */
+  defaultMode: 'read' | 'edit';
+  /** 编辑态显示行号 */
+  showLineNumbers: boolean;
+  /** 缩进宽度 */
+  tabSize: number;
+  /** 用 Tab 而不是空格缩进 */
+  indentWithTabs: boolean;
+  /**
+   * 内存里保留多少个「保存前的版本」。
+   *
+   * 自动保存写的是用户真实的本地文件，没有回收站。这个缓冲是唯一的后悔药，
+   * 因此不提供「0」这个选项。
+   */
+  keepVersions: number;
+}
+
 /** 完整设置 */
 export interface Settings {
   appearance: AppearanceSettings;
   markdown: MarkdownSettings;
   reading: ReadingSettings;
   advanced: AdvancedSettings;
+  editor: EditorSettings;
   /** 配置结构版本，用于未来的迁移 */
   schemaVersion: number;
 }
 
-/** 当前设置结构版本 */
-export const SETTINGS_SCHEMA_VERSION = 1;
+/**
+ * 当前设置结构版本。
+ *
+ * 从 1 升到 2（新增 `editor` 分组）不配套迁移脚本：`settings.store` 的
+ * `hydrate` 用 `deepMerge(DEFAULT_SETTINGS, 存量数据)` 兜底，旧版本缺失的
+ * 分组会自动补上默认值，这正是当初定下这条 deep-merge 约定的目的。
+ * 已用 schemaVersion:1 的旧结构存量数据实测验证（见 settings.store.test.ts），
+ * 而不是仅凭这段注释的推断——本项目已经因为「断言旧数据是新结构」白屏过一次。
+ */
+export const SETTINGS_SCHEMA_VERSION = 2;
 
 /** 默认设置 —— 单一事实来源 */
 export const DEFAULT_SETTINGS: Settings = {
@@ -176,6 +208,15 @@ export const DEFAULT_SETTINGS: Settings = {
     experimental: false,
     takeoverMarkdownPages: true,
   },
+  editor: {
+    autoSave: true,
+    autoSaveDelay: 800,
+    defaultMode: 'read',
+    showLineNumbers: false,
+    tabSize: 2,
+    indentWithTabs: false,
+    keepVersions: 5,
+  },
 };
 
 /** 各设置项的取值边界，供 UI 与校验共用 */
@@ -184,6 +225,9 @@ export const SETTINGS_BOUNDS = {
   lineHeight: { min: 1.2, max: 2.4, step: 0.1 },
   letterSpacing: { min: 0, max: 2, step: 0.1 },
   autoRefreshInterval: { min: 500, max: 5000, step: 100 },
+  autoSaveDelay: { min: 300, max: 5000, step: 100 },
+  tabSize: { min: 2, max: 8, step: 1 },
+  keepVersions: { min: 1, max: 20, step: 1 },
 } as const;
 
 /** 可选代码块主题（Shiki 内置主题的常用子集，成对出现） */

@@ -1,0 +1,524 @@
+# Review package: 3f18108..HEAD
+
+## Commits
+edd1052 fix: 增强等待改用 allSettled 加超时，用户滚动检测改为比对写入值
+
+## Files changed
+ src/editor/MarkdownEditor.tsx         |  36 +++++++++--
+ src/hooks/useReadingPosition.ts       | 112 ++++++++++++++++++++--------------
+ src/utils/scroll-math.test.ts         |  23 ++++++-
+ src/utils/scroll-math.ts              |  12 ++++
+ src/utils/settle-with-timeout.test.ts |  41 +++++++++++++
+ src/utils/settle-with-timeout.ts      |  19 ++++++
+ 6 files changed, 193 insertions(+), 50 deletions(-)
+
+## Diff
+diff --git a/src/editor/MarkdownEditor.tsx b/src/editor/MarkdownEditor.tsx
+index 13eb31e..daef368 100644
+--- a/src/editor/MarkdownEditor.tsx
++++ b/src/editor/MarkdownEditor.tsx
+@@ -2,31 +2,44 @@ import { useEffect, useRef } from 'react';
+ import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
+ import { markdown } from '@codemirror/lang-markdown';
+ import { Compartment, EditorState, type Extension } from '@codemirror/state';
+ import { EditorView, keymap } from '@codemirror/view';
+ import { useResolvedTheme } from '@/hooks/useTheme';
+ import type { MarkdownRenderer } from '@/markdown/contract';
+ import { ensureBuiltinPlugins } from '@/plugins';
+ import { useSettingsStore } from '@/stores/settings.store';
+ import { debounce } from '@/utils/fn';
+ import { createLogger } from '@/utils/logger';
++import { settleWithTimeout } from '@/utils/settle-with-timeout';
+ import { createBlockCache, type BlockCache } from './block-cache';
+ import { renderBlocks, type LineHeading } from './block-render';
+ import { enhanceBlock } from './enhance';
+ import { livePreview, setBlocks } from './live-preview';
+ import { editorTheme } from './theme';
+ 
+ const log = createLogger('markdown-editor');
+ 
+ /** 重新渲染块的防抖间隔。打字期间不必每个字符都重排整篇 */
+ const RENDER_DEBOUNCE_MS = 200;
+ 
++/**
++ * 一批块增强的超时保险丝，不是性能开关。
++ *
++ * `enhanceMounted` 等这批 `enhanceBlock` 全部落定才回调 `onEnhanced`——
++ * 如果某个 `plugin.enhance` 异常挂起（既不 resolve 也不 reject，比如
++ * Mermaid 碰到某些畸形输入卡死），没有这根保险丝的话 `onEnhanced` 就
++ * 永远不会触发，依赖它的阅读位置校正也就永久失效。各内置插件目前都用
++ * try/catch 包住了渲染逻辑，正常情况下走不到超时分支；万一走到，代价
++ * 也只是校正晚触发几秒，好过永远不触发。不要为了「更快校正」调小它。
++ */
++const ENHANCE_SETTLE_TIMEOUT_MS = 5000;
++
+ export interface MarkdownEditorProps {
+   /** 文档源文本 */
+   value: string;
+   /** 文档 id，变化表示换了文档，需要整体重建 */
+   documentId: string;
+   /** 相对链接基准 */
+   baseUrl?: string | undefined;
+   /** 是否只读 */
+   readOnly: boolean;
+   /** 文本变化（编辑态才会触发） */
+@@ -131,34 +144,38 @@ export function MarkdownEditor({
+     if (!host || !cache) return;
+ 
+     cache.clear();
+ 
+     /**
+      * 增强当前挂在 DOM 上的块。
+      *
+      * widget 是按需创建的，这里只能处理此刻存在的那些；滚动带出来的新块
+      * 由下面 updateListener 里的视口分支补上。
+      *
+-     * 收集每个块的增强 Promise 并等待整批结束后回调 `onEnhanced`——
++     * 收集每个块的增强 Promise 并等待整批落定后回调 `onEnhanced`——
+      * Shiki 上色、Mermaid 出图都会显著改变块高度，依赖精确像素位置的
+      * 消费方（阅读位置恢复）需要一个「这一轮真的做完了」的信号，而不是
+      * 「已经发起了」。`enhanceBlock` 对已增强的块也会返回一个即时 resolve
+      * 的 Promise，所以这里不需要单独判断是否有活要干。
++     *
++     * 用 `settleWithTimeout` 而不是裸 `Promise.all`：任何一个增强器挂起
++     * 不 resolve，都不能让 `onEnhanced` 永久沉默，见上面
++     * `ENHANCE_SETTLE_TIMEOUT_MS` 的说明。
+      */
+     const enhanceMounted = (view: EditorView, force = false): void => {
+       const base = callbacksRef.current.baseUrl;
+       const tasks: Promise<void>[] = [];
+       for (const node of view.dom.querySelectorAll<HTMLElement>('.cm-md-block')) {
+         const key = node.dataset.blockKey;
+         if (key !== undefined) tasks.push(enhanceBlock(node, key, cache, base, force));
+       }
+-      void Promise.all(tasks).then(() => {
++      void settleWithTimeout(tasks, ENHANCE_SETTLE_TIMEOUT_MS).then(() => {
+         callbacksRef.current.onEnhanced?.();
+       });
+     };
+ 
+     const rerender = (view: EditorView): void => {
+       const renderer = rendererRef.current;
+       // 管线还在下载。此刻渲染出来的会是一个没有插件的裸 markdown-it——
+       // 脚注、公式、代码高亮一个都不会出现。引导完成后会主动补一次
+       if (!renderer) return;
+ 
+@@ -237,22 +254,33 @@ export function MarkdownEditor({
+           const [{ createMarkdownRenderer }] = await Promise.all([
+             import('@/markdown'),
+             ensureBuiltinPlugins(),
+           ]);
+           if (cancelled) return;
+           rendererRef.current = createMarkdownRenderer();
+           rerender(view);
+         } catch (error) {
+           log.error('Markdown 管线加载失败，正文将保持源码形态', error);
+         } finally {
+-          // 引导失败也要通知：view 本身依然可用（只是停在源码形态），
+-          // 外部消费方不该因为渲染管线的失败而永远等不到一个 view
++          /*
++           * 引导失败也要通知：view 本身依然可用（只是停在源码形态），
++           * 外部消费方不该因为渲染管线的失败而永远等不到一个 view。
++           *
++           * 如实记录这不是「修好了」，而是把问题从主路径挪到了失败路径：
++           * 管线加载失败时 rerender 从未执行过，view 停在未渲染的源码
++           * 形态，此时把它交给阅读位置恢复，算出来的仍然是按源码行高
++           * 换算的错误像素目标——(a) 要解决的 Critical 在这条降级路径上
++           * 依然成立，只是概率低（管线加载失败本身就很少见）。能接受
++           * 这个已知残留，是因为管线加载失败时脚注、公式、代码高亮
++           * 全部一起失效，阅读位置差几行是这次整体降级里最不重要的
++           * 一环，不值得为它单独加一套重试或阻塞逻辑。
++           */
+           notifyViewReady();
+         }
+       })();
+     }
+ 
+     return () => {
+       cancelled = true;
+       scheduleRerender.cancel();
+       reenhanceRef.current = null;
+       // 销毁前先通知外部——阅读位置 hook 靠这个信号丢掉即将失效的 view 引用
+diff --git a/src/hooks/useReadingPosition.ts b/src/hooks/useReadingPosition.ts
+index b395187..d87084e 100644
+--- a/src/hooks/useReadingPosition.ts
++++ b/src/hooks/useReadingPosition.ts
+@@ -2,27 +2,42 @@ import { useCallback, useEffect, useRef } from 'react';
+ import type { EditorView } from '@codemirror/view';
+ import { scrollToLine } from '@/editor/MarkdownEditor';
+ import { useScrollContainer } from '@/components/layout/ScrollContainerContext';
+ import { useSettingsStore } from '@/stores/settings.store';
+ import {
+   flushReadingPositions,
+   hydrateReadingPositions,
+   recallPosition,
+   rememberPosition,
+ } from '@/utils/reading-position';
+-import { heightInDocument, offsetWithinBlock } from '@/utils/scroll-math';
++import { heightInDocument, isWithinScrollTolerance, offsetWithinBlock } from '@/utils/scroll-math';
+ 
+ /** 保存位置的节流间隔 */
+ const SAVE_THROTTLE = 400;
+ 
+-/** 视为「用户手动滚动」的键盘按键——只挑真正会移动滚动位置的那几个 */
+-const SCROLL_KEYS = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ']);
++/**
++ * 判定「这次滚动是不是我们自己引发的」时允许的容差（像素）。
++ *
++ * 不是精确为 0，是因为两类无害的抖动都会让实际值跟我们记的期望值差一点：
++ * 一是浏览器本身的次像素取整；二是块增强改高度时触发的原生 scroll
++ * anchoring——为了不让视觉内容跳动，浏览器会自己顺手把 scrollTop 挪几像素
++ * 去抵消上方内容的高度变化，这个抵消也会派发 `scroll` 事件，值上会跟我们
++ * 最后一次写入的不完全一样。2px 只够吞掉这类「不算真的动了」的抖动；
++ * 一次明显的用户滚动（哪怕是最小的一格滚轮）产生的位移都远大于它。
++ *
++ * 这个容差**不**试图吞掉「上方一大块内容因为增强突然变高，anchoring 把
++ * scrollTop 顶出去几十上百像素」这种大幅漂移——那种情况下会被误判成
++ * 「用户滚动了」，校正因此被跳过。这是有意识的取舍：宁可少校正一次，
++ * 也不要把值判断做成一个「多大都能吞」的黑洞，那样就无法再区分真实的
++ * 用户滚动了。
++ */
++const SCROLL_TOLERANCE_PX = 2;
+ 
+ export interface UseReadingPositionParams {
+   /** 当前文档 id */
+   documentId: string;
+   /** 编辑器实例；未就绪（还没挂载或已卸载）时为 null。只有首轮块渲染完成
+    *  之后 `MarkdownEditor` 才会把它交出来，见该组件 `onViewReady` 的说明 */
+   view: EditorView | null;
+ }
+ 
+ export interface UseReadingPositionResult {
+@@ -63,20 +78,27 @@ export function useReadingPosition({
+   /** 恢复时用来追加像素偏移的那个 rAF，卸载时要能取消 */
+   const offsetFrameRef = useRef(0);
+   /**
+    * 恢复之后，用户是否已经自己滚动过。
+    *
+    * 只要为真，`onEnhanced` 的校正就必须放弃——用户已经滚走了，增强完成后
+    * 把他拽回恢复点，比当初落错位置体验更差。放在 ref 里而不是 state，
+    * 是因为它只在事件回调里读写，不需要触发重渲染。
+    */
+   const userScrolledRef = useRef(false);
++  /**
++   * 我们自己最后一次程序化滚动落定后的 `scrollTop`，用来在 `scroll` 事件里
++   * 甄别「是不是我们自己写的」——见下面 `applyPosition` 与 scroll 监听器里
++   * 的用法，以及 `SCROLL_TOLERANCE_PX` 上方对取值考量的说明。
++   * null 表示这个文档还没发生过任何程序化滚动，此时不做任何判断。
++   */
++  const expectedScrollTopRef = useRef<number | null>(null);
+ 
+   // 首次挂载时把存储里的记录读进内存缓存
+   useEffect(() => {
+     void hydrateReadingPositions();
+   }, []);
+ 
+   // 滚动时记录位置
+   useEffect(() => {
+     if (!container || !view || documentId === '') return;
+ 
+@@ -96,21 +118,44 @@ export function useReadingPosition({
+ 
+       // 容器可视区顶部相对文档顶部的距离，即当前应该记的「高度坐标」
+       const heightInDoc = heightInDocument(container.getBoundingClientRect().top, view.documentTop);
+       const block = view.lineBlockAtHeight(heightInDoc);
+       const line = view.state.doc.lineAt(block.from).number - 1;
+       const offset = offsetWithinBlock(heightInDoc, block.top);
+ 
+       rememberPosition({ documentId, line, offset, updatedAt: now }, shouldPersist);
+     };
+ 
++    /**
++     * 甄别这次滚动是不是我们自己引发的。
++     *
++     * 比较依据是**值**而不是时序——不猜「程序化滚动之后多久算安全」，
++     * 而是把我们自己每次写完 `scrollTop` 后的落点记下来（见 `applyPosition`
++     * 结尾），跟这次滚动事件观察到的实际值比对。差在容差内就认为还是
++     * 我们自己的（或抵消性的 anchoring 抖动），顺手把期望值刷新到当前
++     * 实际值，防止误差累积；差出容差就是用户真的动了手——不管是滚轮、
++     * 触摸板、键盘翻页还是直接拖滚动条，最终都体现为 scrollTop 变了，
++     * 这一种判据能一并覆盖，不需要分别监听各种输入手势。
++     */
++    const checkUserScrolled = (): void => {
++      const expected = expectedScrollTopRef.current;
++      if (expected === null) return;
++      const actual = container.scrollTop;
++      if (isWithinScrollTolerance(actual, expected, SCROLL_TOLERANCE_PX)) {
++        expectedScrollTopRef.current = actual;
++      } else {
++        userScrolledRef.current = true;
++      }
++    };
++
+     const onScroll = (): void => {
++      checkUserScrolled();
+       // 用 rAF 而不是直接保存：滚动事件每帧可能来好几次，
+       // 而 rAF 天然把一帧内的多次触发合并成一次。
+       // 必须包一层箭头函数——rAF 会把时间戳作为首个参数传入，
+       // 直接传 save 会让恒为真的时间戳变成 force，把节流整个绕过
+       if (frame === 0) frame = requestAnimationFrame(() => save());
+     };
+ 
+     /**
+      * 页面被隐藏或即将卸载时立即刷写。
+      *
+@@ -137,66 +182,42 @@ export function useReadingPosition({
+ 
+     return () => {
+       container.removeEventListener('scroll', onScroll);
+       document.removeEventListener('visibilitychange', onVisibilityChange);
+       window.removeEventListener('pagehide', flush);
+       if (frame !== 0) cancelAnimationFrame(frame);
+     };
+   }, [container, view, documentId, shouldPersist]);
+ 
+   /**
+-   * 监听真实的用户滚动手势，而不是 `scroll` 事件本身。
++   * 滚到指定位置，行内偏移在 CodeMirror 的滚动测量之后再叠加一次。
+    *
+-   * `scroll` 事件不区分「用户拖出来的」还是「我们自己写 `scrollTop`/调用
+-   * `scrollToLine` 引发的」，两者混在一起没法安全地当「用户滚走了」的信号。
+-   * wheel / touchmove / 翻页类按键则只会由用户操作触发，我们自己的程序化
+-   * 滚动不会派发这些事件，用它们做判据不需要任何「忽略窗口」之类的时序
+-   * 补丁，也就不存在竞态。
++   * 收尾统一排到一个 rAF 里，不管有没有行内偏移都要跑：这个 rAF 落定后的
++   * `scrollTop` 会被记进 `expectedScrollTopRef`，供上面 `checkUserScrolled`
++   * 做值比对——跳过它会让「我们自己刚滚过」这件事没有留下痕迹，下一次
++   * `scroll` 事件就会被误判成用户动了手。
+    */
+-  useEffect(() => {
+-    if (!container) return;
+-
+-    const markUserScrolled = (): void => {
+-      userScrolledRef.current = true;
+-    };
+-    const onKeyDown = (event: KeyboardEvent): void => {
+-      if (SCROLL_KEYS.has(event.key)) markUserScrolled();
+-    };
+-
+-    container.addEventListener('wheel', markUserScrolled, { passive: true });
+-    container.addEventListener('touchmove', markUserScrolled, { passive: true });
+-    container.addEventListener('keydown', onKeyDown);
+-
+-    return () => {
+-      container.removeEventListener('wheel', markUserScrolled);
+-      container.removeEventListener('touchmove', markUserScrolled);
+-      container.removeEventListener('keydown', onKeyDown);
+-    };
+-  }, [container]);
+-
+-  /** 滚到指定位置，行内偏移在 CodeMirror 的滚动测量之后再叠加一次 */
+   const applyPosition = useCallback(
+     (targetView: EditorView, targetContainer: HTMLElement, line: number, offset: number): void => {
+       scrollToLine(targetView, line);
+-      if (offset > 0) {
+-        /*
+-         * scrollToLine 派发的是 CodeMirror 的 scrollIntoView 效果，实际滚动
+-         * 发生在下一个 rAF 里的测量阶段（见 EditorView.measure）。这里的像素
+-         * 偏移必须叠加在那次滚动**之后**，所以同样排到 rAF——由于两者都在
+-         * 本轮同步代码里调度，浏览器会按注册顺序执行，CM 的测量一定先跑完。
+-         */
+-        if (offsetFrameRef.current !== 0) cancelAnimationFrame(offsetFrameRef.current);
+-        offsetFrameRef.current = requestAnimationFrame(() => {
+-          offsetFrameRef.current = 0;
+-          targetContainer.scrollTop += offset;
+-        });
+-      }
++      /*
++       * scrollToLine 派发的是 CodeMirror 的 scrollIntoView 效果，实际滚动
++       * 发生在下一个 rAF 里的测量阶段（见 EditorView.measure）。行内偏移
++       * 必须叠加在那次滚动**之后**，所以同样排到 rAF——由于两者都在本轮
++       * 同步代码里调度，浏览器会按注册顺序执行，CM 的测量一定先跑完。
++       */
++      if (offsetFrameRef.current !== 0) cancelAnimationFrame(offsetFrameRef.current);
++      offsetFrameRef.current = requestAnimationFrame(() => {
++        offsetFrameRef.current = 0;
++        if (offset > 0) targetContainer.scrollTop += offset;
++        expectedScrollTopRef.current = targetContainer.scrollTop;
++      });
+     },
+     [],
+   );
+ 
+   // 文档就绪后恢复位置一次（受设置控制——这是「跨会话恢复」，可以关掉）
+   useEffect(() => {
+     if (!container || !view || documentId === '' || !shouldPersist) return;
+     // 只在这个文档还没恢复过时动手，避免设置项变化之类的重渲染把用户重新拽走
+     if (restoredDocRef.current === documentId) return;
+ 
+@@ -218,24 +239,25 @@ export function useReadingPosition({
+     if (!container || !view) return;
+     if (restoredDocRef.current !== documentId) return;
+     if (userScrolledRef.current) return;
+ 
+     const position = recallPosition(documentId);
+     if (!position) return;
+ 
+     applyPosition(view, container, position.line, position.offset);
+   }, [container, view, documentId, applyPosition]);
+ 
+-  // 换文档时重置「是否已恢复过」「是否已手动滚动」两个标记，允许在新文档上重新走一遍恢复
++  // 换文档时重置恢复状态相关的三个标记，允许在新文档上重新走一遍恢复
+   useEffect(() => {
+     restoredDocRef.current = null;
+     userScrolledRef.current = false;
++    expectedScrollTopRef.current = null;
+   }, [documentId]);
+ 
+   // 卸载时别留下悬挂的 rAF
+   useEffect(() => {
+     return () => {
+       if (offsetFrameRef.current !== 0) cancelAnimationFrame(offsetFrameRef.current);
+     };
+   }, []);
+ 
+   return { onEnhanced };
+diff --git a/src/utils/scroll-math.test.ts b/src/utils/scroll-math.test.ts
+index 91780ff..eb566c9 100644
+--- a/src/utils/scroll-math.test.ts
++++ b/src/utils/scroll-math.test.ts
+@@ -1,12 +1,12 @@
+ import { describe, expect, it } from 'vitest';
+-import { heightInDocument, offsetWithinBlock } from './scroll-math';
++import { heightInDocument, isWithinScrollTolerance, offsetWithinBlock } from './scroll-math';
+ 
+ describe('heightInDocument', () => {
+   it('容器顶部在文档顶部下方时，返回两者的差', () => {
+     expect(heightInDocument(500, 100)).toBe(400);
+   });
+ 
+   it('容器顶部与文档顶部重合时，返回 0', () => {
+     expect(heightInDocument(100, 100)).toBe(0);
+   });
+ 
+@@ -21,10 +21,31 @@ describe('offsetWithinBlock', () => {
+   });
+ 
+   it('文档内高度恰好等于行块顶部时，偏移为 0', () => {
+     expect(offsetWithinBlock(400, 400)).toBe(0);
+   });
+ 
+   it('测量误差导致文档内高度略小于行块顶部时，夹到 0 而不是负数', () => {
+     expect(offsetWithinBlock(399.5, 400)).toBe(0);
+   });
+ });
++
++describe('isWithinScrollTolerance', () => {
++  it('实际值与期望值完全相同时，在容差内', () => {
++    expect(isWithinScrollTolerance(100, 100, 2)).toBe(true);
++  });
++
++  it('差值恰好等于容差时，仍算在容差内（边界取闭区间）', () => {
++    expect(isWithinScrollTolerance(102, 100, 2)).toBe(true);
++    expect(isWithinScrollTolerance(98, 100, 2)).toBe(true);
++  });
++
++  it('差值超出容差一点时，判定为不在容差内', () => {
++    expect(isWithinScrollTolerance(102.5, 100, 2)).toBe(false);
++    expect(isWithinScrollTolerance(97.5, 100, 2)).toBe(false);
++  });
++
++  it('容差为 0 时，只有完全相等才算在容差内', () => {
++    expect(isWithinScrollTolerance(100, 100, 0)).toBe(true);
++    expect(isWithinScrollTolerance(100.1, 100, 0)).toBe(false);
++  });
++});
+diff --git a/src/utils/scroll-math.ts b/src/utils/scroll-math.ts
+index 3c42b7a..d16403e 100644
+--- a/src/utils/scroll-math.ts
++++ b/src/utils/scroll-math.ts
+@@ -26,10 +26,22 @@ export function heightInDocument(containerTop: number, documentTop: number): num
+  * 给定命中的行块，算出目标高度落在该行内的像素偏移。
+  *
+  * 只记行号还原不到长行/换行行内的精确位置——同一行可能占好几个视觉行，
+  * 这个偏移补的就是「行内的第几个视觉行」。夹到 0 防的是浮点误差：
+  * 命中的块本应满足 `blockTop <= heightInDoc`，但两者都来自不同的测量
+  * 路径，理论上可能出现极小的负差。
+  */
+ export function offsetWithinBlock(heightInDoc: number, blockTop: number): number {
+   return Math.max(0, heightInDoc - blockTop);
+ }
++
++/**
++ * 一次观测到的 `scrollTop` 能否归为「跟我们自己最后一次写入的值一致」。
++ *
++ * `useReadingPosition` 用它甄别一次 `scroll` 事件是不是用户真的动了手：
++ * 差值在容差内就认为还是程序化滚动本身的抖动（次像素取整、增强改高度
++ * 触发的 scroll anchoring），容差的取值考量见调用方 `SCROLL_TOLERANCE_PX`
++ * 上方的说明——这里只负责比较，不负责解释为什么选这个数。
++ */
++export function isWithinScrollTolerance(actual: number, expected: number, tolerance: number): boolean {
++  return Math.abs(actual - expected) <= tolerance;
++}
+diff --git a/src/utils/settle-with-timeout.test.ts b/src/utils/settle-with-timeout.test.ts
+new file mode 100644
+index 0000000..d707c8e
+--- /dev/null
++++ b/src/utils/settle-with-timeout.test.ts
+@@ -0,0 +1,41 @@
++import { describe, expect, it, vi } from 'vitest';
++import { settleWithTimeout } from './settle-with-timeout';
++
++describe('settleWithTimeout', () => {
++  it('全部任务在超时前完成时，不必等到超时就返回', async () => {
++    const task = Promise.resolve('ok');
++    const result = settleWithTimeout([task], 5000);
++    await expect(result).resolves.toBeUndefined();
++  });
++
++  it('某个任务失败（reject）时，仍然当作「已落定」处理，不会让调用方看到 rejection', async () => {
++    const rejected = Promise.reject(new Error('增强失败'));
++    // 提前挂一个空 catch，避免这个测试里出现未处理 rejection 的告警——
++    // 真正要验证的是 settleWithTimeout 本身能扛住失败,而不是这里泄漏
++    rejected.catch(() => undefined);
++    await expect(settleWithTimeout([rejected], 5000)).resolves.toBeUndefined();
++  });
++
++  it('某个任务永远不 resolve 也不 reject 时，超过时限后仍会返回——这是保险丝要保证的行为', async () => {
++    vi.useFakeTimers();
++    try {
++      const hung = new Promise<void>(() => {
++        // 故意什么都不做：模拟一个异常挂起、永远不结束的增强器
++      });
++
++      const result = settleWithTimeout([hung], 1000);
++      const spy = vi.fn();
++      void result.then(spy);
++
++      // 时限之前：保险丝不该提前触发
++      await vi.advanceTimersByTimeAsync(999);
++      expect(spy).not.toHaveBeenCalled();
++
++      // 越过时限：保险丝生效，即使那个任务依然挂起
++      await vi.advanceTimersByTimeAsync(1);
++      expect(spy).toHaveBeenCalledTimes(1);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++});
+diff --git a/src/utils/settle-with-timeout.ts b/src/utils/settle-with-timeout.ts
+new file mode 100644
+index 0000000..4f37c4c
+--- /dev/null
++++ b/src/utils/settle-with-timeout.ts
+@@ -0,0 +1,19 @@
++/**
++ * 等一批任务全部“落定”（无论成功还是失败），但不超过给定时限。
++ *
++ * 用 `Promise.allSettled` 而不是 `Promise.all`：调用方要的是“这批都有了
++ * 结果”这个时机信号，某个任务失败不该让整个信号跟着 reject 掉——那样
++ * 反而会把信号从「迟到」变成「永远拿不到」，比超时本身还糟。
++ *
++ * 超时分支是一根**保险丝**，不是性能开关：正常情况下所有任务会在超时前
++ * 结束，超时只在某个任务异常挂起（既不 resolve 也不 reject）时才会真正
++ * 生效。调小它不会让什么东西「更快」，只会让保险丝更容易在正常任务还没
++ * 跑完时就误触发。
++ */
++export function settleWithTimeout(tasks: readonly Promise<unknown>[], timeoutMs: number): Promise<void> {
++  const allSettled = Promise.allSettled(tasks).then(() => undefined);
++  const timeout = new Promise<void>((resolve) => {
++    setTimeout(resolve, timeoutMs);
++  });
++  return Promise.race([allSettled, timeout]);
++}

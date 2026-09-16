@@ -14,7 +14,13 @@ export interface TocItemProps {
   /** 已折叠的节点 id 集合 */
   collapsed: ReadonlySet<string>;
   onToggle: (id: string) => void;
-  onSelect: (id: string) => void;
+  /**
+   * 点击标题。
+   *
+   * 连行号一起交出去，是因为跳转已经改成按行定位：节点自己手里就有
+   * `line`，让上层再拿 id 回目录里查一遍纯属绕路。
+   */
+  onSelect: (id: string, line: number) => void;
 }
 
 /**
@@ -68,7 +74,7 @@ export const TocItem = memo(function TocItem({
         <button
           type="button"
           data-toc-id={node.id}
-          onClick={() => onSelect(node.id)}
+          onClick={() => onSelect(node.id, node.line)}
           title={node.text}
           className={cn('min-w-0 flex-1 truncate py-1 text-left text-xs', isActive && 'font-medium')}
           style={{ color: isActive ? 'var(--app-accent)' : 'var(--app-text-muted)' }}

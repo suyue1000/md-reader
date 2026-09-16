@@ -4,6 +4,7 @@ import {
   SETTINGS_SCHEMA_VERSION,
   type AdvancedSettings,
   type AppearanceSettings,
+  type EditorSettings,
   type MarkdownSettings,
   type ReadingSettings,
   type Settings,
@@ -45,6 +46,7 @@ export interface SettingsStore {
   setMarkdown: (patch: Partial<MarkdownSettings>) => void;
   setReading: (patch: Partial<ReadingSettings>) => void;
   setAdvanced: (patch: Partial<AdvancedSettings>) => void;
+  setEditor: (patch: Partial<EditorSettings>) => void;
   /** 重置某个分组到默认值 */
   resetGroup: (group: keyof Omit<Settings, 'schemaVersion'>) => void;
   /** 全部恢复默认 */
@@ -61,6 +63,7 @@ const persistSynced = debounce((settings: Settings) => {
     appearance: settings.appearance,
     markdown: settings.markdown,
     reading: settings.reading,
+    editor: settings.editor,
   };
   void writeValue(STORAGE_AREAS.settings, STORAGE_KEYS.settings, payload);
 }, 300);
@@ -91,12 +94,12 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       readValue<Partial<AdvancedSettings>>(STORAGE_AREAS.advanced, STORAGE_KEYS.advanced, {}),
     ]);
 
-    const merged = deepMerge(DEFAULT_SETTINGS, {
+    const merged = {
       ...synced,
       advanced,
       // 结构版本始终以代码为准，为后续迁移留出口子
       schemaVersion: SETTINGS_SCHEMA_VERSION,
-    });
+    } as typeof DEFAULT_SETTINGS;
 
     set({ settings: merged, hydrated: true });
     log.debug('设置已恢复', merged);
@@ -151,6 +154,15 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
     };
     set({ settings: next });
     persist(next, true);
+  },
+
+  setEditor: (patch) => {
+    const next: Settings = {
+      ...get().settings,
+      editor: { ...get().settings.editor, ...patch },
+    };
+    set({ settings: next });
+    persist(next, false);
   },
 
   resetGroup: (group) => {

@@ -19,6 +19,7 @@ import { canUseFilePicker, hasFileSystemAccess } from '@/utils/env';
 import { STORAGE_AREAS, STORAGE_KEYS, writeValue } from '@/utils/storage';
 import { wellKnownStartIn } from '@/utils/start-in';
 import { clearWorkspaceUrls, getWorkspaceUrl, readFileUrl } from '@/utils/file-listing';
+import { confirmDiscardUnsaved } from './useAutoSave';
 import { isEmbedded } from './useEmbeddedDocument';
 import { requestHostFile, requestHostFolder } from './useHostWorkspace';
 import { createLogger } from '@/utils/logger';
@@ -68,6 +69,9 @@ export function useWorkspace(): WorkspaceActions {
 
   const openPath = useCallback(
     async (path: string) => {
+      // 从文件树点开另一篇会顶掉当前这份；有未保存改动时先问一句
+      if (!confirmDiscardUnsaved()) return;
+
       // 自动列出的目录用地址定位，直接读即可——这是接管页面里的常态
       const url = getWorkspaceUrl(path);
       if (url) {
