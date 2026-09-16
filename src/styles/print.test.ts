@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 /**
@@ -13,7 +13,8 @@ import { describe, expect, it } from 'vitest';
 
 /** 把 print.css 解析成 CSSOM */
 function parsePrintCss(): CSSStyleSheet {
-  const path = fileURLToPath(new URL('./print.css', import.meta.url));
+  // 不用 import.meta.url：vitest 的 jsdom 环境里它不是 file: 方案，fileURLToPath 会抛
+  const path = resolve(process.cwd(), 'src/styles/print.css');
   const style = document.createElement('style');
   style.textContent = readFileSync(path, 'utf8');
   document.head.appendChild(style);

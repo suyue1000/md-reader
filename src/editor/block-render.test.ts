@@ -24,10 +24,16 @@ describe('renderBlocks', () => {
     expect(blocks[1]?.html).toContain('正文');
   });
 
-  it('缓存键是块的源码文本，内容相同的两块键也相同', () => {
+  it('缓存键给重复块编号，内容相同的两块键必须不同', () => {
+    /*
+     * 回归：键若只取源码文本，两个内容相同的块会拿到同一个键，块缓存于是
+     * 把同一个 DOM 节点交给两处装饰——后一块把前一块的节点抢走，屏幕上
+     * 那一段直接消失。编号就是为此加的。
+     */
     const { blocks } = render('正文\n\n正文');
-    expect(blocks[0]?.key).toBe('正文');
-    expect(blocks[1]?.key).toBe('正文');
+    expect(blocks[0]?.key).toBe('0 正文');
+    expect(blocks[1]?.key).toBe('1 正文');
+    expect(blocks[0]?.key).not.toBe(blocks[1]?.key);
   });
 
   it('跨块上下文保留：脚注引用能渲染成链接', () => {

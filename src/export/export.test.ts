@@ -122,7 +122,7 @@ describe('saveFile 在选择器不可用时的退路', () => {
     const result = await saveFile('a.html', new Blob(['x']), HTML_TYPE);
 
     expect(click).toHaveBeenCalled();
-    expect(result).toEqual({ status: 'done', filename: 'a.html', bytes: 1 });
+    expect(result).toEqual({ status: 'done', filename: 'a.html', bytes: 1, via: 'download' });
   });
 
   /**
@@ -264,21 +264,23 @@ describe('exportHtml 用调用方给的正文节点', () => {
 
     const content = makeContent('<h1>完整标题</h1><p>第一段</p><p>最后一段</p>');
     const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
-    let saved = '';
     (window as { showSaveFilePicker?: unknown }).showSaveFilePicker = undefined;
+    /*
+     * 捕获点必须是 `URL.createObjectURL`——`downloadViaAnchor` 正是把 blob
+     * 交给它，而整条下载路径上没有任何人调用 `blob.text()`，覆盖
+     * `Blob.prototype.text` 只会得到一个永远空着的数组。
+     */
     const blobs: Blob[] = [];
-    const originalBlobText = Blob.prototype.text;
-    Blob.prototype.text = function capture(this: Blob): Promise<string> {
-      blobs.push(this);
-      return originalBlobText.call(this);
-    };
+    URL.createObjectURL = vi.fn((obj: Blob | MediaSource) => {
+      blobs.push(obj as Blob);
+      return 'blob:stub';
+    });
 
     const result = await exportHtml({ doc: DOC, theme: 'light', source: '源文本', content });
     expect(result.status).toBe('done');
     expect(click).toHaveBeenCalled();
 
-    Blob.prototype.text = originalBlobText;
-    saved = await (blobs[0] as Blob).text();
+    const saved = await (blobs[0] as Blob).text();
     expect(saved).toContain('完整标题');
     expect(saved).toContain('第一段');
     expect(saved).toContain('最后一段');
@@ -299,12 +301,16 @@ describe('exportMarkdown 导出的是传入的源文本', () => {
   /** store 里的 `doc.content` 可能落后一次尚未回写的改动，不能拿它当准 */
   it('用 context.source 而不是 doc.content', async () => {
     vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    /*
+     * 捕获点必须是 `URL.createObjectURL`——`downloadViaAnchor` 正是把 blob
+     * 交给它，而整条下载路径上没有任何人调用 `blob.text()`，覆盖
+     * `Blob.prototype.text` 只会得到一个永远空着的数组。
+     */
     const blobs: Blob[] = [];
-    const originalBlobText = Blob.prototype.text;
-    Blob.prototype.text = function capture(this: Blob): Promise<string> {
-      blobs.push(this);
-      return originalBlobText.call(this);
-    };
+    URL.createObjectURL = vi.fn((obj: Blob | MediaSource) => {
+      blobs.push(obj as Blob);
+      return 'blob:stub';
+    });
 
     await exportMarkdown({
       doc: {
@@ -320,7 +326,6 @@ describe('exportMarkdown 导出的是传入的源文本', () => {
       source: '编辑器里的新文本',
     });
 
-    Blob.prototype.text = originalBlobText;
     const text = await (blobs[0] as Blob).text();
     expect(text).toBe('编辑器里的新文本\n');
   });
@@ -332,11 +337,11 @@ describe('exportPdf', () => {
     vi.restoreAllMocks();
   });
 
-  it('把完整正文挂进 #print-root，afterprint 之后撤掉', () => {
+  it('把完整正文挂进 #print-root，afterprint 之后撤掉', async () => {
     const print = vi.spyOn(window, 'print').mockImplementation(() => undefined);
     const content = makeContent('<h1>完整标题</h1><p>最后一段</p>');
 
-    exportPdf(content);
+    await exportPdf(content);
 
     const root = document.getElementById(PRINT_ROOT_ID);
     expect(root).not.toBeNull();
@@ -348,22 +353,22 @@ describe('exportPdf', () => {
     expect(document.getElementById(PRINT_ROOT_ID)).toBeNull();
   });
 
-  it('挂进去的是克隆，原节点不被搬走', () => {
+  it('挂进去的是克隆，原节点不被搬走', async () => {
     vi.spyOn(window, 'print').mockImplementation(() => undefined);
     const host = document.createElement('div');
     const content = makeContent('<p>正文</p>');
     host.appendChild(content);
     document.body.appendChild(host);
 
-    exportPdf(content);
+    await exportPdf(content);
 
     // 离屏渲染那棵树的所有权仍在调用方手上，dispose 还要靠它
     expect(content.parentElement).toBe(host);
   });
 
-  it('纸上不留只有 JS 才能用的按钮', () => {
+  it('纸上不留只有 JS 才能用的按钮', async () => {
     vi.spyOn(window, 'print').mockImplementation(() => undefined);
-    exportPdf(
+    await exportPdf(
       makeContent(
         '<figure class="code-block"><figcaption class="code-block__bar">' +
           '<span class="code-block__actions"><button>复制</button></span>' +

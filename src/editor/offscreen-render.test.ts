@@ -47,7 +47,7 @@ describe('renderOffscreen', () => {
 
   beforeEach(() => {
     original = globalThis.IntersectionObserver;
-    globalThis.IntersectionObserver = NeverFiringObserver as unknown as typeof IntersectionObserver;
+    globalThis.IntersectionObserver = NeverFiringObserver;
   });
 
   afterEach(() => {

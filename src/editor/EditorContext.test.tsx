@@ -31,7 +31,8 @@ function Probe({ onReady }: { onReady: (set: (view: EditorView | null) => void) 
 /** 渲染探针，返回写入口与重渲染入口 */
 function mount(): { setView: (view: EditorView | null) => void; rerender: () => void } {
   let setView!: (view: EditorView | null) => void;
-  const tree = (
+  // 每次都造新元素：传同一个引用回去，React 会判定无变化而整棵跳过重渲染
+  const tree = (): React.JSX.Element => (
     <EditorViewProvider>
       <Probe
         onReady={(fn) => {
@@ -40,8 +41,8 @@ function mount(): { setView: (view: EditorView | null) => void; rerender: () => 
       />
     </EditorViewProvider>
   );
-  const { rerender } = render(tree);
-  return { setView: (view) => setView(view), rerender: () => rerender(tree) };
+  const { rerender } = render(tree());
+  return { setView: (view) => setView(view), rerender: () => rerender(tree()) };
 }
 
 const seen = (): string => screen.getByTestId('seen').textContent ?? '';

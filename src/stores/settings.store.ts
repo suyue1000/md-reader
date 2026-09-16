@@ -94,12 +94,18 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
       readValue<Partial<AdvancedSettings>>(STORAGE_AREAS.advanced, STORAGE_KEYS.advanced, {}),
     ]);
 
-    const merged = {
+    /*
+     * 必须以 DEFAULT_SETTINGS 为骨架深合并，不能直接铺开存量数据：
+     * schemaVersion 从 1 升到 2 新增了 editor 分组，旧数据里压根没有这个 key，
+     * 直接断言成新类型会让它变成 undefined 一路传到渲染层（本项目在
+     * ReadingPosition 改结构时已经这样白屏过一次）。
+     */
+    const merged = deepMerge(DEFAULT_SETTINGS, {
       ...synced,
       advanced,
       // 结构版本始终以代码为准，为后续迁移留出口子
       schemaVersion: SETTINGS_SCHEMA_VERSION,
-    } as typeof DEFAULT_SETTINGS;
+    });
 
     set({ settings: merged, hydrated: true });
     log.debug('设置已恢复', merged);

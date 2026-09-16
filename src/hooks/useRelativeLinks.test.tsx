@@ -1,11 +1,12 @@
-import { render } from '@testing-library/react';
+import { act, render } from '@testing-library/react';
 import type { EditorView } from '@codemirror/view';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import { ScrollContainerProvider } from '@/components/layout/ScrollContainerContext';
 import { buildTocTree } from '@/markdown/toc';
 import { useDocumentStore } from '@/stores/document.store';
 import { useWorkspaceStore } from '@/stores/workspace.store';
 import type { MarkdownDocument } from '@/types';
+import type * as FileOpenModule from '@/utils/file-open';
 import { useRelativeLinks } from './useRelativeLinks';
 
 /** 只替换 scrollToLine：跳没跳、跳到第几行，是锚点这条路径的全部可观察行为 */
@@ -34,7 +35,7 @@ vi.mock('./useWorkspace', () => ({
 
 /** 相对链接分支要问「这个路径在工作区里吗」，只放行我们准备好的那一个 */
 vi.mock('@/utils/file-open', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@/utils/file-open')>()),
+  ...(await importOriginal<typeof FileOpenModule>()),
   getFileHandleByPath: (path: string): unknown =>
     path === 'docs/install.md' ? { kind: 'file' } : undefined,
 }));
@@ -60,7 +61,7 @@ function doc(path: string): MarkdownDocument {
 let container: HTMLElement;
 let view: EditorView | null;
 /** 拦下 log.warn，避免「找不到锚点」那一条刷进测试输出 */
-let warn: ReturnType<typeof vi.spyOn>;
+let warn: MockInstance;
 
 function Probe(): null {
   useRelativeLinks(view);
@@ -251,7 +252,10 @@ describe('正文里的站内锚点链接', () => {
     clickLink('#第二节');
     expect(scrollToLine).not.toHaveBeenCalled();
 
-    useDocumentStore.getState().setToc(TOC);
+    // 目录经 effect 同步进 latestRef，不冲刷的话 ref 里还是空目录
+    act(() => {
+      useDocumentStore.getState().setToc(TOC);
+    });
     clickLink('#第二节');
 
     expect(scrollToLine).toHaveBeenCalledWith(view, 37);

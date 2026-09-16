@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import type { EditorView } from '@codemirror/view';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -13,7 +14,9 @@ import { useReadingPosition, type UseReadingPositionResult } from './useReadingP
  */
 const scrollToLine = vi.fn();
 vi.mock('@/editor/MarkdownEditor', () => ({
-  scrollToLine: (view: EditorView, line: number) => scrollToLine(view, line),
+  scrollToLine: (view: EditorView, line: number): void => {
+    scrollToLine(view, line);
+  },
 }));
 
 const DOC_ID = 'doc:已经读过的文档';
@@ -25,9 +28,22 @@ let view: EditorView;
 let result: UseReadingPositionResult;
 
 /** `view` 可由用例覆盖：有一组用例要先给已销毁的实例、再换成活的 */
-function Probe({ view: override }: { view?: EditorView }): null {
-  result = useReadingPosition({ documentId: DOC_ID, view: override ?? view });
-  return null;
+function Probe({ view: override }: { view?: EditorView }): React.JSX.Element {
+  const value = useReadingPosition({ documentId: DOC_ID, view: override ?? view });
+  // 渲染期给外部变量赋值是副作用（react-hooks/globals），挪进 effect 里捎给用例
+  useEffect(() => {
+    result = value;
+  });
+  // 增强完成的信号只有 MarkdownEditor 知道，用例靠点这个按钮来模拟它
+  return (
+    <button
+      type="button"
+      data-testid="enhanced"
+      onClick={() => {
+        value.onEnhanced();
+      }}
+    />
+  );
 }
 
 /** 挂载被测 hook；`ScrollContainerProvider` 提供它需要的滚动容器 */

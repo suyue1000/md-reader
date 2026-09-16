@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { act, render } from '@testing-library/react';
 import type { EditorView } from '@codemirror/view';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -10,7 +11,9 @@ import { usePendingAnchor } from './usePendingAnchor';
 /** 只替换 scrollToLine：跳没跳、跳到第几行，是这个 hook 的全部可观察行为 */
 const scrollToLine = vi.fn();
 vi.mock('@/editor/MarkdownEditor', () => ({
-  scrollToLine: (view: EditorView, line: number) => scrollToLine(view, line),
+  scrollToLine: (view: EditorView, line: number): void => {
+    scrollToLine(view, line);
+  },
 }));
 
 const TOC = buildTocTree([
@@ -37,7 +40,11 @@ let view: EditorView | null;
 let onEnhanced: (() => void) | null = null;
 
 function Probe(): null {
-  onEnhanced = usePendingAnchor(view).onEnhanced;
+  const value = usePendingAnchor(view).onEnhanced;
+  // 渲染期给外部变量赋值是副作用（react-hooks/globals），挪进 effect 里捎给用例
+  useEffect(() => {
+    onEnhanced = value;
+  });
   return null;
 }
 
@@ -60,16 +67,22 @@ function enhance(): void {
 }
 
 /**
- * 等一帧。
+ * 把落点测量推到落定。
  *
- * hook 是在 rAF 里量落点并记 `expectedScrollTop` 的，不等这一帧，
- * 「用户是不是已经自己滚走了」那道甄别就拿不到基线。
+ * hook 用 `afterScrollSettles` 逐帧观察 `scrollTop` 才记下
+ * `expectedScrollTop`，而这里的 `scrollToLine` 是替身、根本不会真的滚动，
+ * 值一次都不变，于是要跑满上限 8 帧才收尾。只推一帧的话 `expectedScrollTop`
+ * 还是 null，撤防的值比对判据会被整条跳过——用户滚走了也照样把他拽回锚点。
  */
+const SETTLE_FRAMES = 10;
+
 async function nextFrame(): Promise<void> {
   await act(async () => {
-    await new Promise<void>((resolve) => {
-      requestAnimationFrame(() => resolve());
-    });
+    for (let i = 0; i < SETTLE_FRAMES; i++) {
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve());
+      });
+    }
   });
 }
 

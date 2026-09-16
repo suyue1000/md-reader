@@ -5,6 +5,7 @@ import { useDocumentStore } from '@/stores/document.store';
 import { BackToTop } from './BackToTop';
 
 let container: HTMLElement;
+let scrollTo: ReturnType<typeof vi.fn>;
 
 /**
  * 按钮只在滚过阈值之后才出现，而 jsdom 里没有真实布局，`scrollTop` 得自己写。
@@ -28,8 +29,11 @@ async function mountScrolledDown(): Promise<void> {
 
 beforeEach(() => {
   useDocumentStore.getState().reset();
-  // jsdom 的 Element 没有实现 scrollTo
-  Element.prototype.scrollTo = vi.fn();
+  // jsdom 的 Element 没有实现 scrollTo；替身单独留一份引用，
+  // 断言直接指着原型方法会被 unbound-method 拦下
+  scrollTo = vi.fn();
+  // scrollTo 是重载签名，vi.fn() 的类型对不上，这里的转换是必需的
+  Element.prototype.scrollTo = scrollTo as unknown as Element['scrollTo'];
 });
 
 afterEach(() => {
@@ -37,7 +41,7 @@ afterEach(() => {
 });
 
 describe('返回顶部', () => {
-  it('点击时记一次显式导航', () => {
+  it('点击时记一次显式导航', async () => {
     /*
      * 「回到顶部」满足显式导航的三条判定（见 store 的 `navigationEpoch`）：
      * 用户点了按钮、落点由我们指定、视口真的被带走。不记的话，刚恢复过阅读
@@ -46,19 +50,19 @@ describe('返回顶部', () => {
      * 指望它撤防来不及——这正是目录点击栽过的那个坑。
      */
     const before = useDocumentStore.getState().navigationEpoch;
-    mountScrolledDown();
+    await mountScrolledDown();
 
     fireEvent.click(screen.getByRole('button', { name: '返回顶部' }));
 
     expect(useDocumentStore.getState().navigationEpoch).toBe(before + 1);
   });
 
-  it('滚动到顶部这件事本身还是要做', () => {
+  it('滚动到顶部这件事本身还是要做', async () => {
     // 反向对照：别让撤防把功能本身挤掉
-    mountScrolledDown();
+    await mountScrolledDown();
 
     fireEvent.click(screen.getByRole('button', { name: '返回顶部' }));
 
-    expect(Element.prototype.scrollTo).toHaveBeenCalledWith({ top: 0, behavior: 'smooth' });
+    expect(scrollTo).toHaveBeenCalledWith({ top: 0, behavior: 'smooth' });
   });
 });

@@ -1,6 +1,6 @@
 import { useCallback } from 'react';
 import { act, render, screen, waitFor } from '@testing-library/react';
-import { EditorView } from '@codemirror/view';
+import type { EditorView } from '@codemirror/view';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EditorViewProvider, useSetEditorView } from '@/editor/EditorContext';
 import { MarkdownEditor } from '@/editor/MarkdownEditor';
@@ -80,8 +80,9 @@ async function waitForBlocks(): Promise<void> {
 
 /** 点一下某个导出按钮，并等产物落袋 */
 async function clickExport(testId: string): Promise<void> {
-  await act(async () => {
+  await act(() => {
     screen.getByTestId(testId).click();
+    return Promise.resolve();
   });
   await waitFor(() => {
     expect(savedBlobs.length).toBeGreaterThan(0);
@@ -171,8 +172,9 @@ describe('导出', () => {
     mount();
     await waitForBlocks();
 
-    await act(async () => {
+    await act(() => {
       screen.getByTestId('pdf').click();
+      return Promise.resolve();
     });
     await waitFor(
       () => {

@@ -120,7 +120,7 @@ describe('useGlobalHotkeys', () => {
 
     press(document.body, 'e');
     // enterEdit 是 async，没有句柄时不会真的等待，但仍要让微任务跑完
-    await act(async () => undefined);
+    await act(() => Promise.resolve());
 
     expect(useDocumentStore.getState().mode).toBe('edit');
   });
@@ -128,7 +128,7 @@ describe('useGlobalHotkeys', () => {
   it('编辑态下在可编辑正文里按 mod+e 仍能退回阅读态', async () => {
     render(<Probe />);
     press(document.body, 'e');
-    await act(async () => undefined);
+    await act(() => Promise.resolve());
     expect(useDocumentStore.getState().mode).toBe('edit');
 
     /*
@@ -137,7 +137,7 @@ describe('useGlobalHotkeys', () => {
      * 用户进得去、出不来，而快捷键失灵在测试里是完全静默的。
      */
     press(editableTarget(), 'e');
-    await act(async () => undefined);
+    await act(() => Promise.resolve());
 
     expect(useDocumentStore.getState().mode).toBe('read');
   });
@@ -211,7 +211,7 @@ describe('useGlobalHotkeys', () => {
     render(<Probe />);
 
     press(document.body, 'e');
-    await act(async () => undefined);
+    await act(() => Promise.resolve());
 
     expect(useDocumentStore.getState().mode).toBe('read');
   });
