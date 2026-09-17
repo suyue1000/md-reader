@@ -28,12 +28,17 @@ function fakeHandle(name: string) {
   return { handle, getFile, createWritable, stream, written };
 }
 
-/** 让选择器返回指定句柄 */
-function pickerReturns(handle: FileSystemFileHandle): void {
+/** 让选择器返回指定句柄，并记下它收到的选项 */
+function pickerReturns(handle: FileSystemFileHandle): { options: Record<string, unknown>[] } {
+  const options: Record<string, unknown>[] = [];
   vi.stubGlobal(
     'showOpenFilePicker',
-    vi.fn(() => Promise.resolve([handle])),
+    vi.fn((received: Record<string, unknown>) => {
+      options.push(received);
+      return Promise.resolve([handle]);
+    }),
   );
+  return { options };
 }
 
 beforeEach(() => {
@@ -119,6 +124,40 @@ describe('第一道闸：授权时校验选中的是不是同一个文件', () =
     await grantWrite(reply);
 
     expect(replies[0]?.type).toBe('md-reader:write-granted');
+  });
+});
+
+describe('选择器开在哪里', () => {
+  /** 授权走通所需的最小布置 */
+  function readyHandle(name: string) {
+    const f = fakeHandle(name);
+    f.getFile.mockResolvedValue({ text: () => Promise.resolve('正文'), lastModified: 5 });
+    return f;
+  }
+
+  it('从当前文件所属的知名目录打开，用户少翻几层', async () => {
+    /*
+     * 浏览器不接受任意路径作为起始位置，只认知名目录常量。这是能给出的
+     * 最精确的提示——加上固定的 id，第二次起浏览器会直接停在上次那个目录。
+     */
+    history.replaceState(null, '', '/Users/suyue/Desktop/github/甲.md');
+    const f = readyHandle('甲.md');
+    const picker = pickerReturns(f.handle);
+
+    await grantWrite(reply);
+
+    expect(picker.options[0]).toMatchObject({ id: 'md-reader-write', startIn: 'desktop' });
+  });
+
+  it('认不出知名目录时不传 startIn，交给浏览器用默认位置', async () => {
+    // 传一个浏览器不认的值会让选择器直接抛错，宁可不传
+    history.replaceState(null, '', '/var/tmp/甲.md');
+    const f = readyHandle('甲.md');
+    const picker = pickerReturns(f.handle);
+
+    await grantWrite(reply);
+
+    expect(picker.options[0]).not.toHaveProperty('startIn');
   });
 });
 

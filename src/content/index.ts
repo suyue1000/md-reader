@@ -208,12 +208,25 @@ export async function grantWrite(reply: (message: HostMessage) => void): Promise
     return;
   }
 
+  /*
+   * 让选择器尽量开在离目标近的地方。
+   *
+   * 浏览器**不接受任意路径**作为起始位置，只认几个知名目录常量或一个已经
+   * 拿到的句柄——而这里手上只有一个 `file://` 地址。于是与 `pickFolder` 用
+   * 同一招：认出它属于哪个知名目录，至少落在正确的那一支上。
+   *
+   * 固定的 `id` 是另一半：浏览器会记住这个 id 上次选过的目录，第一次靠
+   * `startIn` 落到大方向，之后每次直接停在上次那个目录。
+   */
+  const startIn = wellKnownStartIn(location.href);
+
   let picked: FileSystemFileHandle | undefined;
   try {
     // 用户在 iframe 里的点击会把短暂用户激活传播给祖先帧，这里仍握着手势
     [picked] = await showOpenFilePicker({
       id: 'md-reader-write',
       multiple: false,
+      ...(startIn ? { startIn } : {}),
       types: [
         {
           description: 'Markdown 文件',
