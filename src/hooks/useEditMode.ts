@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef } from 'react';
 import { useDocumentStore } from '@/stores/document.store';
 import { useSettingsStore } from '@/stores/settings.store';
 import { useUiStore } from '@/stores/ui.store';
+import { hasHostChannel, requestWriteGrant } from '@/editor/host-write';
 import { ensureFileWritePermission, getCurrentFileHandle } from '@/utils/file-open';
 import { formatCombo, isMacPlatform } from '@/utils/hotkeys';
 
@@ -53,11 +54,69 @@ export function useEditMode(): EditModeControls {
     const { setMode, setWritable } = useDocumentStore.getState();
     const handle = getCurrentFileHandle();
 
+    /*
+     * 记下「这是第几次打开」。
+     *
+     * 下面两条分支都要 await 一个**用户可能盯着看很久**的系统对话框（写权限
+     * 授权框、文件选择器），而弹着的时候用户完全可以换一篇文档——切换前那个
+     * 未保存确认框就是入口。落定后 store 里的 document 已经是另一篇了。
+     *
+     * 不核对的后果分两档：轻的是给乙记上一份只对甲成立的写权限；重的是代劳
+     * 分支里那次 `applyRefreshedDocument`——它会把**甲的正文**替换进乙，而乙
+     * 的下一次保存就把甲的内容写进了乙的文件。同一类事故在另存那条路上真的
+     * 发生过，记在 `editor/save.ts` 头部。
+     */
+    const epoch = useDocumentStore.getState().openEpoch;
+    /** await 落定后，这次结果还属不属于当初那篇文档 */
+    const sameDocument = (): boolean => useDocumentStore.getState().openEpoch === epoch;
+
     if (handle) {
       const outcome = await ensureFileWritePermission(handle, true);
+      if (!sameDocument()) return;
       setWritable(outcome === 'granted');
       if (outcome !== 'granted') {
         showNotice(`未获得写入权限，改动不会自动写回原文件；按 ${SAVE_HOTKEY} 会再申请一次`, 'info');
+      }
+    } else if (hasHostChannel()) {
+      /*
+       * 被内容脚本接管的 file:// 页面。这里的阅读器是跨源 iframe，浏览器
+       * 禁止它弹任何文件选择器，句柄只能由宿主页面代持——所以要请用户在
+       * 宿主弹出的选择器里亲手选中**正在看的这一篇**。绕不过去：File System
+       * Access API 没有「由 URL 换取句柄」的能力。
+       */
+      const outcome = await requestWriteGrant();
+      if (!sameDocument()) return;
+      setWritable(outcome.kind === 'granted');
+
+      if (outcome.kind === 'granted') {
+        const doc = useDocumentStore.getState().document;
+        /*
+         * 第二道闸：宿主回传的是磁盘上的**真实字节**，而页面上那份取自
+         * 浏览器渲染出来的 <pre>，二者未必逐字节相同（换行、BOM 都可能被
+         * 归一），文件也可能在打开之后被别的程序改过。
+         *
+         * 不一致时以磁盘为准重载。这保证写回的基线是真实字节——否则用户
+         * 什么都没改、按一下保存，就会把一份被变换过的文本盖回原文件，
+         * 而「保存不做任何文本规整」是这个功能的底线。
+         */
+        if (doc && outcome.content !== doc.content) {
+          useDocumentStore.getState().applyRefreshedDocument({
+            ...doc,
+            content: outcome.content,
+            size: new Blob([outcome.content]).size,
+            lastModified: outcome.lastModified,
+          });
+          showNotice('磁盘上的内容与页面上那份不一致，已按磁盘的版本重新载入', 'info');
+        } else if (doc) {
+          // 基线对齐：写回时要拿它跟磁盘比对，不对齐第一次保存就会被判成冲突
+          useDocumentStore.getState().applyRefreshedDocument({
+            ...doc,
+            lastModified: outcome.lastModified,
+          });
+        }
+      } else if (!(outcome.kind === 'denied' && outcome.cancelled)) {
+        const reason = outcome.kind === 'denied' ? outcome.reason : '宿主页面不可用';
+        showNotice(`未获得写回授权：${reason}`, 'info');
       }
     } else {
       // 拖拽或 <input type="file"> 打开的文档没有句柄，原地写回无从谈起

@@ -167,6 +167,16 @@ async function runSave(text: string, automatic: boolean, showNotice: ShowNotice)
       }
       break;
 
+    case 'host-stale':
+      /*
+       * 宿主在写之前发现磁盘已被别的程序改过，一个字节都没写。绝不能
+       * `markSaved`——那会把「已保存」记在一份根本没落盘的内容上，脏状态
+       * 清零、关页不再拦截，而用户的改动还在编辑器里悬着。
+       */
+      store.setSaveStatus('error', outcome.message);
+      showNotice(`${outcome.message}，这次没有写入；请重新打开这篇文档后再改`, 'error');
+      break;
+
     case 'denied':
       store.setSaveStatus('error', '未获得写入权限');
       showNotice('未获得写入权限，改动尚未保存', 'error');

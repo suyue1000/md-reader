@@ -34,6 +34,22 @@ const SETTINGS_KEY = 'settings';
 /** 挂到页面上的 iframe id，用于避免重复接管 */
 const FRAME_ID = 'md-reader-frame';
 
+/**
+ * 本次接管的一次性令牌（见 protocol.ts 的 `LoadMessage.nonce`）。
+ *
+ * 阅读器发回来的消息里，凡是会读写用户文件的都必须带上它。
+ */
+const NONCE = crypto.randomUUID();
+
+/**
+ * 代阅读器握着的当前文件句柄；null 表示还没授权过。
+ *
+ * 句柄**留在宿主这一侧**，与目录句柄同理：文件系统权限是按源授予的，
+ * 传给 `chrome-extension://` 那边就成了一个没有权限的对象，而那一侧恰恰
+ * 弹不出授权框。跨越边界的始终只有普通数据。
+ */
+let writeHandle: FileSystemFileHandle | null = null;
+
 /** 当前地址是否指向一个 Markdown 文件 */
 function isMarkdownUrl(url: string): boolean {
   try {
@@ -145,6 +161,144 @@ async function pickFolder(reply: (message: HostMessage) => void): Promise<void> 
   }
 }
 
+/**
+ * 代阅读器弹出文件选择器，授权写回**当前这篇**文档。
+ *
+ * 为什么要用户亲手再选一次自己正看着的文件：File System Access API 没有
+ * 「由 URL 换取句柄」的能力，句柄只能来自一次真实的选择器交互。
+ *
+ * 这里只关第一道闸（文件名）——它挡的是「用户选错了另一个文件」，那会把
+ * 甲的内容写进乙，不可逆且没有回收站。第二道闸（磁盘内容是否与页面上那份
+ * 一致）放在阅读器侧：只有它手里有当前正文。本函数负责把磁盘上的**真实
+ * 字节**原样回传过去供它比对。
+ *
+ * 文件名比对依赖 `fileNameFrom` 已经做过 `decodeURIComponent`：`location.href`
+ * 里的中文是百分号编码的，而 `handle.name` 是解码后的原文，不解码这道闸会
+ * **永远拒绝**，功能一次都用不了。
+ *
+ * ## 覆盖缺口（如实记下）
+ *
+ * 本函数与 `writeCurrentFile` 的两道闸**没有任何自动化测试**：它们住在内容
+ * 脚本里、未导出，而这个模块末尾就调用 `main()`，import 它即产生副作用。
+ * 阅读器侧那条通道（`editor/host-write.ts`）是有测试的，但它测不到这里。
+ * 也就是说，「选错文件被挡下」和「磁盘被改过就拒写」这两件最要命的事，
+ * 目前只能靠真实浏览器验收，跑绿测试不说明它们成立。
+ */
+async function grantWrite(reply: (message: HostMessage) => void): Promise<void> {
+  if (typeof showOpenFilePicker !== 'function') {
+    reply({
+      type: 'md-reader:write-denied',
+      reason: '当前浏览器不支持写回本地文件',
+      cancelled: false,
+    });
+    return;
+  }
+
+  let picked: FileSystemFileHandle | undefined;
+  try {
+    // 用户在 iframe 里的点击会把短暂用户激活传播给祖先帧，这里仍握着手势
+    [picked] = await showOpenFilePicker({
+      id: 'md-reader-write',
+      multiple: false,
+      types: [
+        {
+          description: 'Markdown 文件',
+          accept: { 'text/markdown': MARKDOWN_EXTENSIONS },
+        },
+      ],
+    });
+  } catch (error) {
+    const cancelled = error instanceof DOMException && error.name === 'AbortError';
+    reply({
+      type: 'md-reader:write-denied',
+      reason: cancelled ? '已取消授权' : error instanceof Error ? error.message : String(error),
+      cancelled,
+    });
+    return;
+  }
+
+  // 选择器正常返回时数组一定非空，但类型上是可选的；不判的话下面对
+  // picked.name 的校验会在类型层面失守，而那正是防止写错文件的第一道闸
+  if (!picked) {
+    reply({ type: 'md-reader:write-denied', reason: '没有选中任何文件', cancelled: true });
+    return;
+  }
+
+  const expected = fileNameFrom(location.href);
+  if (picked.name !== expected) {
+    /*
+     * 硬拒绝而不是提示后放行：放行一次的代价是把这篇文档的内容写进另一个
+     * 文件。同名不同目录这一道闸挡不住，那由阅读器侧的内容比对兜底。
+     */
+    reply({
+      type: 'md-reader:write-denied',
+      reason: `选中的是 ${picked.name}，与当前文档 ${expected} 不是同一个文件`,
+      cancelled: false,
+    });
+    return;
+  }
+
+  try {
+    const file = await picked.getFile();
+    const content = await file.text();
+    writeHandle = picked;
+    reply({ type: 'md-reader:write-granted', content, lastModified: file.lastModified });
+  } catch (error) {
+    reply({
+      type: 'md-reader:write-denied',
+      reason: error instanceof Error ? error.message : String(error),
+      cancelled: false,
+    });
+  }
+}
+
+/**
+ * 代阅读器把文本写回原文件。
+ *
+ * 写之前必须自检磁盘时间戳：嵌入模式的文档 `source` 是 'url'，而
+ * `useAutoRefresh` 只对 'fs-handle' 轮询，于是整套冲突检测在这条路径上根本
+ * 不运行（`decideSaveTarget` 的 `conflictPending` 永远是 null）。不在这里挡
+ * 一道，代劳写回就会静默覆盖别的程序刚写进去的内容。
+ *
+ * 这道闸同样没有自动化测试，理由见 `grantWrite` 的「覆盖缺口」一节。
+ */
+async function writeCurrentFile(
+  text: string,
+  baseModified: number,
+  reply: (message: HostMessage) => void,
+): Promise<void> {
+  if (!writeHandle) {
+    reply({ type: 'md-reader:write-error', message: '尚未授权写回', stale: false });
+    return;
+  }
+
+  try {
+    const before = await writeHandle.getFile();
+    if (before.lastModified !== baseModified) {
+      reply({
+        type: 'md-reader:write-error',
+        message: '磁盘上的文件已被其它程序改动',
+        stale: true,
+      });
+      return;
+    }
+
+    const writable = await writeHandle.createWritable();
+    await writable.write(text);
+    await writable.close();
+
+    // 读回真实时间戳交给阅读器，作为下一次写入的比对基线
+    const after = await writeHandle.getFile();
+    reply({ type: 'md-reader:write-ok', lastModified: after.lastModified });
+  } catch (error) {
+    reply({
+      type: 'md-reader:write-error',
+      message: error instanceof Error ? error.message : String(error),
+      stale: false,
+    });
+  }
+}
+
 /** 读取工作区里的某个文件并回传内容 */
 async function readWorkspaceFile(
   path: string,
@@ -194,6 +348,7 @@ function takeOver(source: string): void {
     url: location.href,
     content: source,
     hash: location.hash,
+    nonce: NONCE,
   };
 
   /** 往 iframe 里发一条消息 */
@@ -224,6 +379,22 @@ function takeOver(source: string): void {
 
       case 'md-reader:read-file':
         void readWorkspaceFile(event.data.path, reply);
+        return;
+
+      /*
+       * 下面两条会读写用户的真实文件，因此逐条核对令牌。
+       * `EMBED_FLAG` 只是一个 URL 查询参数，任何页面都能构造一个
+       * `viewer.html?embed=1` 的 iframe 冒充对话；令牌由本次接管随机生成，
+       * 只经 postMessage 送给自己那个 iframe，第三方拿不到。
+       */
+      case 'md-reader:grant-write':
+        if (event.data.nonce !== NONCE) return;
+        void grantWrite(reply);
+        return;
+
+      case 'md-reader:write-file':
+        if (event.data.nonce !== NONCE) return;
+        void writeCurrentFile(event.data.text, event.data.baseModified, reply);
         return;
     }
   });

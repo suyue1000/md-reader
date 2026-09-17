@@ -12,6 +12,14 @@ export type SaveTarget =
   | { kind: 'write'; handle: FileSystemFileHandle }
   /** 有句柄但写权限未授予，需要用户手势重新申请 */
   | { kind: 'needs-permission'; handle: FileSystemFileHandle }
+  /**
+   * 没有本地句柄，但宿主页面握着句柄、可以代劳写回原文件。
+   *
+   * 只出现在「浏览器直接打开 .md、被内容脚本接管」这条路径上：那里的阅读器
+   * 是跨源 iframe，自己既拿不到句柄、也弹不出选择器去换一个，句柄只能留在
+   * 宿主侧，写入经由 postMessage 代劳（见 `content/protocol.ts`）。
+   */
+  | { kind: 'host-write' }
   /** 无句柄，弹保存对话框另存 */
   | { kind: 'save-as' }
   /** 连保存对话框都弹不出（跨源 iframe），退到浏览器下载 */
@@ -24,6 +32,13 @@ export interface SaveContext {
   handle: FileSystemFileHandle | null;
   writable: boolean;
   canUsePicker: boolean;
+  /**
+   * 宿主页面是否已握住当前文件的句柄、可以代劳写回。
+   *
+   * 由 `GrantWriteMessage` 那次授权置真：用户在宿主弹出的选择器里亲手选中
+   * 了当前这篇文档，宿主校验文件名相符后留住句柄。
+   */
+  hostWritable: boolean;
   /** 由定时器触发（true）还是用户按下 ⌘S（false） */
   automatic: boolean;
   /**
@@ -65,6 +80,14 @@ export function decideSaveTarget(context: SaveContext): SaveTarget {
   if (context.handle && context.writable) {
     return { kind: 'write', handle: context.handle };
   }
+
+  /*
+   * 代劳写回同样是「能静默完成」的——授权在进入编辑态时就一次性拿到了，
+   * 写的时候不需要任何用户参与。所以这一条必须排在下面那句 `automatic`
+   * 短路**之前**：排在后面的话自动保存永远走不到它，接管页面上这个功能就
+   * 只剩手动 ⌘S 一条路，而「停笔就自动写回」恰恰是它最大的价值。
+   */
+  if (context.hostWritable) return { kind: 'host-write' };
 
   // 到这里说明写不回原文件，后续每条路都需要用户参与
   if (context.automatic) return { kind: 'clean' };

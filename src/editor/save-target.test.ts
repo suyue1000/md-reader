@@ -8,6 +8,7 @@ const context = (overrides: Partial<SaveContext> = {}): SaveContext => ({
   handle,
   writable: true,
   canUsePicker: true,
+  hostWritable: false,
   automatic: false,
   conflictPending: false,
   ...overrides,
@@ -52,6 +53,47 @@ describe('decideSaveTarget', () => {
 
   it('自动保存在有写权限时正常写回', () => {
     expect(decideSaveTarget(context({ automatic: true }))).toEqual({ kind: 'write', handle });
+  });
+});
+
+describe('decideSaveTarget：宿主代劳写回（接管的 file:// 页面）', () => {
+  /** 接管路径上阅读器自己永远没有句柄，写权限也无从谈起 */
+  const embedded = (overrides: Partial<SaveContext> = {}): SaveContext =>
+    context({ handle: null, writable: false, canUsePicker: false, ...overrides });
+
+  it('宿主已授权时交给宿主代写', () => {
+    expect(decideSaveTarget(embedded({ hostWritable: true }))).toEqual({ kind: 'host-write' });
+  });
+
+  it('自动保存也要能走代劳这条路——否则停笔自动写回整个失效', () => {
+    /*
+     * 这条守的是分支顺序：`host-write` 必须排在「automatic 且写不回原文件
+     * 就安静收手」那句短路之前。排反了不会有任何编译错误，只会让接管页面上
+     * 的自动保存永远静默不动，而用户以为它在工作。
+     */
+    expect(decideSaveTarget(embedded({ hostWritable: true, automatic: true }))).toEqual({
+      kind: 'host-write',
+    });
+  });
+
+  it('本地句柄优先于代劳：两者都在时直接自己写', () => {
+    expect(decideSaveTarget(context({ hostWritable: true }))).toEqual({ kind: 'write', handle });
+  });
+
+  it('冲突未决时代劳同样一个字节都不写', () => {
+    expect(
+      decideSaveTarget(embedded({ hostWritable: true, conflictPending: true })),
+    ).toEqual({ kind: 'conflict' });
+  });
+
+  it('没有改动时不劳烦宿主', () => {
+    expect(decideSaveTarget(embedded({ hostWritable: true, dirty: false }))).toEqual({
+      kind: 'clean',
+    });
+  });
+
+  it('没拿到代劳授权时仍按原路降级到下载', () => {
+    expect(decideSaveTarget(embedded())).toEqual({ kind: 'download' });
   });
 });
 

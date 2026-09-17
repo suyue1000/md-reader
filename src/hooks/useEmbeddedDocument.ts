@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { useDocumentStore } from '@/stores/document.store';
 import { EMBED_FLAG, isLoadMessage, type ViewerMessage } from '@/content/protocol';
+import { setHostNonce } from '@/editor/host-write';
 import { createLogger } from '@/utils/logger';
 import type { MarkdownDocument } from '@/types';
 
@@ -130,6 +131,12 @@ export function useEmbeddedDocument(): void {
         source: 'url',
         baseUrl: url,
       };
+
+      /*
+       * 先记下令牌再交文档：令牌是之后请宿主代劳写回的唯一凭证
+       * （见 editor/host-write.ts）。`isLoadMessage` 已经保证它非空。
+       */
+      setHostNonce(message.nonce);
 
       log.info('接收到宿主页面的文档', message.name);
       setDocument(doc);

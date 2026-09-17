@@ -6,6 +6,7 @@ import { canUseFilePicker } from '@/utils/env';
 // 守卫之后登记（理由见下方 performSave 头部）
 import { ensureFileWritePermission, getCurrentFileHandle } from '@/utils/file-open';
 import { createLogger } from '@/utils/logger';
+import { hasHostChannel, requestHostWrite } from './host-write';
 import { decideSaveTarget } from './save-target';
 import { recordSelfWrite } from './self-write';
 import { createVersionBuffer, type VersionBuffer } from './versions';
@@ -100,6 +101,16 @@ export type SaveOutcome =
    * 一条「已保存」的提示、一个不再拦截关页的标签页，和一个原封未动的文件。
    */
   | { kind: 'downloaded'; filename: string }
+  /**
+   * 宿主代劳写回时，在动手**之前**发现磁盘已被别的程序改过，这次
+   * 一个字节都没写。
+   *
+   * 与 `conflict-pending` 分开：那一种是本应用自己早已知道冲突（由
+   * `decideRefresh` 判出、提示条正挂着），而这一种是「我们以为磁盘还是
+   * 老样子、直到写之前才发现不是」——接管路径上 `useAutoRefresh` 根本不
+   * 轮询，除了宿主这一道自检没有任何别的地方能发现它。
+   */
+  | { kind: 'host-stale'; message: string }
   | { kind: 'skipped' }
   /** 冲突未决，这次保存没有发生（见 `decideSaveTarget` 的 conflict 分支） */
   | { kind: 'conflict-pending' }
@@ -138,6 +149,8 @@ export async function performSave(text: string, automatic: boolean): Promise<Sav
     handle: getCurrentFileHandle(),
     writable: state.writable,
     canUsePicker: canUseFilePicker(),
+    // 接管页面上没有本地句柄，写权限落在「宿主已授权代劳」这件事上
+    hostWritable: hasHostChannel() && state.writable,
     automatic,
     conflictPending: state.conflict !== null,
   });
@@ -162,6 +175,23 @@ export async function performSave(text: string, automatic: boolean): Promise<Sav
 
     case 'write':
       return writeThrough(target.handle, text, doc.content, false);
+
+    case 'host-write': {
+      // 先留后悔药再动磁盘，与 writeThrough 同理：写失败了缓冲里多一版无害，
+      // 写成功了没留就没救了
+      pushVersionBeforeOverwrite(doc.content);
+
+      /*
+       * 把我们认为的磁盘时间戳一并交过去，宿主写之前拿它比对真实值。
+       * 这是这条路径上**唯一**的冲突闸门（理由见 SaveOutcome 的 host-stale）。
+       */
+      const result = await requestHostWrite(text, doc.lastModified);
+      if (result.kind === 'written') {
+        return { kind: 'saved', lastModified: result.lastModified, permissionGranted: false };
+      }
+      if (result.stale) return { kind: 'host-stale', message: result.message };
+      return { kind: 'error', message: result.message };
+    }
 
     case 'save-as':
     case 'download': {
