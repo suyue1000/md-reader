@@ -33,9 +33,16 @@ export function setHostNonce(value: string): void {
   nonce = value;
 }
 
-/** 当前是否存在可用的宿主通道 */
+/**
+ * 当前是否存在可用的宿主通道。
+ *
+ * 判 `typeof` 而不是 `!== null`：后者对 `undefined` 是宽松的。万一
+ * `protocol.ts` 里 `isLoadMessage` 那道 nonce 校验失守，`setHostNonce` 会拿到
+ * `undefined`，通道于是被误认为可用——请求发出去后宿主核对不通过、静默不回，
+ * promise 永远挂着，用户按 ⌘S 毫无反应。宁可判严一档。
+ */
 export function hasHostChannel(): boolean {
-  return nonce !== null;
+  return typeof nonce === 'string' && nonce !== '';
 }
 
 /** 仅供测试：清掉握手状态，避免用例之间互相污染 */
@@ -95,9 +102,10 @@ export type GrantOutcome =
 
 /** 请宿主弹选择器，授权写回当前文档。必须在用户手势的调用栈内调用 */
 export async function requestWriteGrant(): Promise<GrantOutcome> {
-  if (nonce === null) return { kind: 'unavailable' };
+  const token = nonce;
+  if (!hasHostChannel() || token === null) return { kind: 'unavailable' };
 
-  const reply = await ask({ type: 'md-reader:grant-write', nonce }, [
+  const reply = await ask({ type: 'md-reader:grant-write', nonce: token }, [
     'md-reader:write-granted',
     'md-reader:write-denied',
   ]);
@@ -128,9 +136,12 @@ export async function requestHostWrite(
   text: string,
   baseModified: number,
 ): Promise<HostWriteOutcome> {
-  if (nonce === null) return { kind: 'failed', message: '没有可用的宿主通道', stale: false };
+  const token = nonce;
+  if (!hasHostChannel() || token === null) {
+    return { kind: 'failed', message: '没有可用的宿主通道', stale: false };
+  }
 
-  const reply = await ask({ type: 'md-reader:write-file', nonce, text, baseModified }, [
+  const reply = await ask({ type: 'md-reader:write-file', nonce: token, text, baseModified }, [
     'md-reader:write-ok',
     'md-reader:write-error',
   ]);

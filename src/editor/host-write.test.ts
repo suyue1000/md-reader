@@ -35,6 +35,19 @@ describe('宿主通道的握手', () => {
     expect(hasHostChannel()).toBe(false);
   });
 
+  it('令牌是空串时通道同样不可用，且不发任何消息', async () => {
+    /*
+     * 判据必须比 `!== null` 严。空串（以及万一漏过校验的 undefined）都不是
+     * 能用的令牌：带着它发出去，宿主核对不通过会静默不回，promise 永远挂着，
+     * 用户按 ⌘S 毫无反应——比直接报「没有通道」难查得多。
+     */
+    setHostNonce('');
+
+    expect(hasHostChannel()).toBe(false);
+    await expect(requestWriteGrant()).resolves.toEqual({ kind: 'unavailable' });
+    expect(sent).toHaveLength(0);
+  });
+
   it('授权请求在没有宿主时直接返回 unavailable，不发任何消息', async () => {
     await expect(requestWriteGrant()).resolves.toEqual({ kind: 'unavailable' });
     expect(sent).toHaveLength(0);
