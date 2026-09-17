@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { useDocumentStore } from '@/stores/document.store';
 import { getCurrentFileHandle, getFileHandleByPath, setCurrentFileHandle } from '@/utils/file-open';
 import type { MarkdownDocument } from '@/types';
+import { resetHostChannel, setHostNonce } from './host-write';
 import { isSelfWrite } from './self-write';
 import { performSave, popPreviousVersion } from './save';
 
@@ -74,6 +75,8 @@ afterEach(() => {
     useDocumentStore.getState().reset();
   });
   setCurrentFileHandle(null);
+  resetHostChannel();
+  vi.restoreAllMocks();
   delete (window as { showSaveFilePicker?: unknown }).showSaveFilePicker;
   delete (window as { showOpenFilePicker?: unknown }).showOpenFilePicker;
   // 排空版本缓冲，避免用例互相污染
@@ -254,6 +257,99 @@ describe('performSave：弹不出保存对话框（download 分支）', () => {
     // 下载与「当前文件」是两回事，句柄不许被动
     expect(getCurrentFileHandle()).toBeNull();
     expect(useDocumentStore.getState().writable).toBe(false);
+  });
+});
+
+describe('performSave：宿主代劳写回（host-write 分支）', () => {
+  /** 接管页面的场景：没有本地句柄，写权限落在「宿主已授权代劳」上 */
+  function embedded(content: string): void {
+    setCurrentFileHandle(null);
+    setHostNonce('nonce-甲');
+    setDoc(content);
+    act(() => {
+      useDocumentStore.getState().setWritable(true);
+    });
+  }
+
+  /** 扮演宿主，记下它收到的请求并回一条指定消息 */
+  function hostReplies(reply: Record<string, unknown>): { requests: unknown[] } {
+    const requests: unknown[] = [];
+    vi.spyOn(window.parent, 'postMessage').mockImplementation((message: unknown) => {
+      requests.push(message);
+      window.dispatchEvent(new MessageEvent('message', { data: reply, source: window }));
+    });
+    return { requests };
+  }
+
+  it('把文本与比对基线交给宿主，成功后如实报 saved', async () => {
+    embedded('旧内容');
+    const { requests } = hostReplies({ type: 'md-reader:write-ok', lastModified: 2000 });
+
+    const outcome = await performSave('新内容', false);
+
+    expect(outcome).toEqual({ kind: 'saved', lastModified: 2000, permissionGranted: false });
+    // setDoc 给的 lastModified 是 1000，它必须原样成为宿主的比对基线
+    expect(requests).toEqual([
+      { type: 'md-reader:write-file', nonce: 'nonce-甲', text: '新内容', baseModified: 1000 },
+    ]);
+  });
+
+  it('代劳写回不谎称自己申请过写权限', async () => {
+    // permissionGranted 只属于 needs-permission 那条路；报真了会让调用方
+    // 把一份并不存在的本地授权记进 store
+    embedded('旧内容');
+    hostReplies({ type: 'md-reader:write-ok', lastModified: 2000 });
+
+    const outcome = await performSave('新内容', false);
+
+    expect(outcome).toMatchObject({ permissionGranted: false });
+  });
+
+  it('动磁盘之前先把旧内容存进版本缓冲', async () => {
+    embedded('旧内容');
+    hostReplies({ type: 'md-reader:write-ok', lastModified: 2000 });
+
+    await performSave('新内容', false);
+
+    expect(popPreviousVersion()).toBe('旧内容');
+  });
+
+  it('宿主拒写时版本缓冲里**仍然**留着旧内容', async () => {
+    /*
+     * 这条守的是顺序：push 必须发生在请求写回**之前**。若写成「成功之后
+     * 才 push」，这里就什么都弹不出来——而这正是用户最需要后悔药的时刻。
+     * 写失败了缓冲里多一版无害，写成功了没留就没救了。
+     */
+    embedded('旧内容');
+    hostReplies({
+      type: 'md-reader:write-error',
+      message: '磁盘上的文件已被其它程序改动',
+      stale: true,
+    });
+
+    const outcome = await performSave('新内容', false);
+
+    expect(outcome).toEqual({ kind: 'host-stale', message: '磁盘上的文件已被其它程序改动' });
+    expect(popPreviousVersion()).toBe('旧内容');
+  });
+
+  it('宿主报普通错误时归入 error，不混进 host-stale', async () => {
+    // 两者的善后完全不同：stale 要请用户重开文档，普通错误只是这次没写成
+    embedded('旧内容');
+    hostReplies({ type: 'md-reader:write-error', message: '磁盘已满', stale: false });
+
+    const outcome = await performSave('新内容', false);
+
+    expect(outcome).toEqual({ kind: 'error', message: '磁盘已满' });
+  });
+
+  it('自动保存也走代劳这条路——停笔自动写回正是它最大的价值', async () => {
+    embedded('旧内容');
+    hostReplies({ type: 'md-reader:write-ok', lastModified: 2000 });
+
+    const outcome = await performSave('新内容', true);
+
+    expect(outcome).toMatchObject({ kind: 'saved' });
   });
 });
 
