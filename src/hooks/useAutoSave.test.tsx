@@ -4,6 +4,7 @@ import { EditorView } from '@codemirror/view';
 import { act, render, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EditorViewProvider, useSetEditorView } from '@/editor/EditorContext';
+import { resetHostChannel, setHostNonce } from '@/editor/host-write';
 import { popPreviousVersion } from '@/editor/save';
 import { clearSelfWrites } from '@/editor/self-write';
 import { useDocumentStore } from '@/stores/document.store';
@@ -644,6 +645,67 @@ describe('useAutoSave：弹不出保存对话框时的降级', () => {
       expect(notice).toContain('原文件没有改动');
       expect(notice).not.toContain('已另存为');
     }
+  });
+});
+
+describe('useAutoSave：宿主拒写（host-stale）', () => {
+  afterEach(() => {
+    resetHostChannel();
+    vi.restoreAllMocks();
+  });
+
+  it('磁盘被别人改过而宿主拒写时，不许清脏状态、不许报「已保存」', async () => {
+    /*
+     * 接管页面上这是**唯一**能发现「磁盘被别人改了」的地方：文档 source 是
+     * 'url'，而 useAutoRefresh 只对 'fs-handle' 轮询，整套冲突检测在这条
+     * 路径上根本不运行。宿主在动手之前比对时间戳，不符就拒写，一个字节都
+     * 没有落盘。
+     *
+     * 这里若误写成 markSaved：document.content 被推进成编辑器里的文本、
+     * dirty 归零、关页拦截失效、状态栏报「已保存」——而用户的文件没被碰过，
+     * 磁盘上还是别人写的那一版，编辑器里这份改动谁也救不回来。
+     * 与 downloaded 分支是同一类要害。
+     */
+    const EMBEDDED: MarkdownDocument = { ...DOC, id: 'file:///甲.md', source: 'url' };
+    setCurrentFileHandle(null);
+    setHostNonce('nonce-甲');
+    // 扮演宿主：收到写回请求就回一条「磁盘已被改动」
+    vi.spyOn(window.parent, 'postMessage').mockImplementation(() => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: {
+            type: 'md-reader:write-error',
+            message: '磁盘上的文件已被其它程序改动',
+            stale: true,
+          },
+          source: window,
+        }),
+      );
+    });
+    act(() => {
+      useDocumentStore.getState().setDocument(EMBEDDED);
+      useDocumentStore.getState().setMode('edit');
+      useDocumentStore.getState().setWritable(true);
+    });
+    mount('改过的内容');
+
+    await act(async () => {
+      await commands.current?.saveNow();
+    });
+
+    const state = useDocumentStore.getState();
+    // 「上次与磁盘一致的内容」不许被推进——这次根本没写
+    expect(state.document?.content).toBe(DOC.content);
+    expect(state.dirty).toBe(true);
+    expect(state.saveStatus).toBe('error');
+    // 关页拦截必须还在：改动确实还悬在编辑器里
+    const event = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    // 提示要说清「没写成」以及为什么
+    const notice = useUiStore.getState().notice?.text ?? '';
+    expect(notice).toContain('已被其它程序改动');
+    expect(notice).toContain('这次没有写入');
   });
 });
 
