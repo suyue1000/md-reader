@@ -50,6 +50,17 @@ const NONCE = crypto.randomUUID();
  */
 let writeHandle: FileSystemFileHandle | null = null;
 
+/**
+ * 丢掉代劳句柄。
+ *
+ * **生产代码没有调用点，只有测试在用**——用来构造「还没授权过」这一情形，
+ * 以及避免用例之间互相污染。如实记在这里，理由与 `editor/self-write.ts` 的
+ * `clearSelfWrites` 相同：让读代码的人不必猜它是不是被谁漏掉了。
+ */
+export function clearWriteHandle(): void {
+  writeHandle = null;
+}
+
 /** 当前地址是否指向一个 Markdown 文件 */
 function isMarkdownUrl(url: string): boolean {
   try {
@@ -176,15 +187,18 @@ async function pickFolder(reply: (message: HostMessage) => void): Promise<void> 
  * 里的中文是百分号编码的，而 `handle.name` 是解码后的原文，不解码这道闸会
  * **永远拒绝**，功能一次都用不了。
  *
- * ## 覆盖缺口（如实记下）
+ * ## 为什么这个函数是导出的
  *
- * 本函数与 `writeCurrentFile` 的两道闸**没有任何自动化测试**：它们住在内容
- * 脚本里、未导出，而这个模块末尾就调用 `main()`，import 它即产生副作用。
- * 阅读器侧那条通道（`editor/host-write.ts`）是有测试的，但它测不到这里。
- * 也就是说，「选错文件被挡下」和「磁盘被改过就拒写」这两件最要命的事，
- * 目前只能靠真实浏览器验收，跑绿测试不说明它们成立。
+ * 生产代码里没有第二个调用点，导出纯粹是为了让测试够得着——这两道闸挡的是
+ * 「把甲的内容写进乙」和「覆盖掉别的程序刚写进去的东西」，都是不可逆且没有
+ * 回收站的事，不该只靠人工验收。同样的如实标注见 `editor/self-write.ts` 的
+ * `clearSelfWrites`。
+ *
+ * import 本模块在测试环境里是安全的：末尾那次 `main()` 会在三道守卫上早退
+ * （jsdom 的 location 不是 `.md`，`document.contentType` 也不是 `text/plain`），
+ * 实测 import 不会接管页面。
  */
-async function grantWrite(reply: (message: HostMessage) => void): Promise<void> {
+export async function grantWrite(reply: (message: HostMessage) => void): Promise<void> {
   if (typeof showOpenFilePicker !== 'function') {
     reply({
       type: 'md-reader:write-denied',
@@ -262,7 +276,7 @@ async function grantWrite(reply: (message: HostMessage) => void): Promise<void> 
  *
  * 这道闸同样没有自动化测试，理由见 `grantWrite` 的「覆盖缺口」一节。
  */
-async function writeCurrentFile(
+export async function writeCurrentFile(
   text: string,
   baseModified: number,
   reply: (message: HostMessage) => void,
